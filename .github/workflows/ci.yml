@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Lint (Format)
+        run: uv run black --check .
+
+      - name: Lint (Ruff)
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy src/actions
+
+      - name: Test
+        run: uv run pytest --maxfail=1 --disable-warnings -q

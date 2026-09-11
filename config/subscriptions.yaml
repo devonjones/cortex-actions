@@ -1,0 +1,19 @@
+# Which Cortex label events go to which downstream queue.
+#
+# label   glob matched against the full label name. `*` spans `/`, so
+#         "Cortex/Family/School/*" covers "Cortex/Family/School/DPS" and
+#         anything deeper. It does NOT match the bare parent
+#         "Cortex/Family/School" -- add that separately if it is ever applied.
+# queue   destination queue name. Cannot be "actions" (that is our own input).
+# events  which label transitions to route. Default ["added"].
+#
+# A label matching nothing is normal and is not an error -- most Cortex/*
+# traffic has no subscriber.
+
+subscriptions:
+  # cortex-school: DPS mail for Aurelia (DSA) and Ana (Isabella Bird).
+  # Subscribed at the prefix, not at Cortex/Family/School, because Gmail child
+  # labels do not imply the parent and nothing ever applies the bare parent.
+  - label: "Cortex/Family/School/*"
+    queue: school
+    events: [added]

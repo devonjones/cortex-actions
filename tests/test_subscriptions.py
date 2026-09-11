@@ -1,0 +1,127 @@
+import pytest
+
+from actions.subscriptions import Subscription, SubscriptionError, parse, targets
+
+SCHOOL = {"subscriptions": [{"label": "Cortex/Family/School/*", "queue": "school"}]}
+
+
+def test_defaults_to_added_only():
+    (sub,) = parse(SCHOOL)
+    assert sub.events == frozenset({"added"})
+    assert sub.matches("Cortex/Family/School/DPS", "added")
+    assert not sub.matches("Cortex/Family/School/DPS", "removed")
+
+
+def test_glob_spans_slashes_but_not_the_bare_parent():
+    (sub,) = parse(SCHOOL)
+    assert sub.matches("Cortex/Family/School/DPS", "added")
+    assert sub.matches("Cortex/Family/School/DPS/Forms", "added")
+    # Gmail child labels do not imply the parent, and nothing applies the bare
+    # parent -- but if that changes it must be subscribed to explicitly.
+    assert not sub.matches("Cortex/Family/School", "added")
+    assert not sub.matches("Cortex/Family/Medical/Kaiser", "added")
+
+
+def test_matching_is_case_sensitive():
+    # fnmatchcase, not fnmatch: on a case-insensitive filesystem the latter
+    # would quietly route Cortex/family/... too.
+    (sub,) = parse(SCHOOL)
+    assert not sub.matches("cortex/family/school/dps", "added")
+
+
+def test_unmatched_yields_no_targets_and_is_not_an_error():
+    subs = parse(SCHOOL)
+    assert targets(subs, "Cortex/Automated/Social/Nextdoor", "added") == []
+
+
+def test_targets_are_deduplicated_and_ordered():
+    subs = parse(
+        {
+            "subscriptions": [
+                {"label": "Cortex/Family/*", "queue": "school"},
+                {"label": "Cortex/Family/School/*", "queue": "school"},
+                {"label": "Cortex/*", "queue": "archive"},
+            ]
+        }
+    )
+    assert targets(subs, "Cortex/Family/School/DPS", "added") == ["school", "archive"]
+
+
+def test_opt_in_to_removed():
+    subs = parse(
+        {
+            "subscriptions": [
+                {
+                    "label": "Cortex/Family/School/*",
+                    "queue": "school",
+                    "events": ["added", "removed"],
+                }
+            ]
+        }
+    )
+    assert targets(subs, "Cortex/Family/School/DPS", "removed") == ["school"]
+
+
+def test_refuses_to_route_back_into_its_own_queue():
+    # Would re-enqueue every event it just claimed, forever.
+    with pytest.raises(SubscriptionError, match="loop forever"):
+        parse({"subscriptions": [{"label": "Cortex/*", "queue": "actions"}]})
+
+
+@pytest.mark.parametrize(
+    "doc,match",
+    [
+        ([], "must be a mapping"),
+        ({}, "missing 'subscriptions'"),
+        ({"subscriptions": "school"}, "must be a list"),
+        ({"subscriptions": [{"queue": "school"}]}, "'label' must be"),
+        ({"subscriptions": [{"label": "Cortex/*"}]}, "'queue' must be"),
+        (
+            {"subscriptions": [{"label": "Cortex/*", "queue": "two words"}]},
+            "whitespace",
+        ),
+        (
+            {"subscriptions": [{"label": "Cortex/*", "queue": "s", "events": []}]},
+            "non-empty list",
+        ),
+        (
+            {
+                "subscriptions": [
+                    {"label": "Cortex/*", "queue": "s", "events": ["moved"]}
+                ]
+            },
+            "unknown event",
+        ),
+    ],
+)
+def test_malformed_tables_are_fatal(doc, match):
+    # Every one of these is a typo that would silently misdirect mail.
+    with pytest.raises(SubscriptionError, match=match):
+        parse(doc)
+
+
+def test_duplicate_rule_is_rejected():
+    with pytest.raises(SubscriptionError, match="duplicate"):
+        parse(
+            {
+                "subscriptions": [
+                    {"label": "Cortex/Family/School/*", "queue": "school"},
+                    {"label": "Cortex/Family/School/*", "queue": "school"},
+                ]
+            }
+        )
+
+
+def test_shipped_config_is_valid_and_routes_the_real_label():
+    """The config/ file in this repo must actually work."""
+    from pathlib import Path
+
+    from actions.subscriptions import load
+
+    subs = load(Path(__file__).parent.parent / "config" / "subscriptions.yaml")
+    assert targets(subs, "Cortex/Family/School/DPS", "added") == ["school"]
+
+
+def test_subscription_is_hashable_and_frozen():
+    sub = Subscription("Cortex/*", "school", frozenset({"added"}))
+    assert {sub, sub} == {sub}
