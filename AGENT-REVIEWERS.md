@@ -5,7 +5,7 @@
   "defaults_version_checked": "1.6.0",
   "disabled": [],
   "bots": {
-    "gemini": true
+    "gemini": false
   }
 }
 ```
