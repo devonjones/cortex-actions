@@ -868,8 +868,14 @@ def test_a_stale_fail_report_is_reported_as_lost(monkeypatch, spy):
     monkeypatch.setattr(
         R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
     )
+    before = counter("cortex_errors", service=R.SERVICE, error_type="job_failed")
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "lost"
+    # Someone else owns the job now. Charging `job_failed` for their work is
+    # how one slow batch becomes a failure count nobody can trace.
+    assert (
+        counter("cortex_errors", service=R.SERVICE, error_type="job_failed") == before
+    )
 
 
 # -- the malformed-event guard ---------------------------------------------

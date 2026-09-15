@@ -497,9 +497,9 @@ class Router:
         charged, which is the outcome `release()` was going to ask for anyway.
         """
         job_id = job.get("id")
-        ERRORS.labels(service=SERVICE, error_type=_ERROR_TYPE[kind]).inc()
         if conn is None:
             # We never got a connection, so there is nothing to say it on.
+            ERRORS.labels(service=SERVICE, error_type="never_started").inc()
             logger.error(
                 "no connection to settle on; leaving it to the visibility timeout",
                 job_id=job_id,
@@ -535,11 +535,15 @@ class Router:
         if not held:
             # The claim expired under us and someone else owns the job now.
             # Reporting our own outcome for their work is how one slow batch
-            # becomes a `failed` count nobody can trace to a failure.
+            # becomes a `failed` count nobody can trace to a failure -- which
+            # is why the ERRORS increment lives HERE and on the branch below,
+            # rather than at the top of this function where it fired before
+            # anything knew whether we still held the claim.
             ERRORS.labels(service=SERVICE, error_type="claim_lost").inc()
             logger.warning("claim lost before settling", job_id=job_id, outcome=kind)
             return self._counted("lost")
 
+        ERRORS.labels(service=SERVICE, error_type=_ERROR_TYPE[kind]).inc()
         return self._counted(kind)
 
     def _drop_conn(self) -> None:
