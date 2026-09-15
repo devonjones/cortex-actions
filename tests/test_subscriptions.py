@@ -1,6 +1,12 @@
 import pytest
 
-from actions.subscriptions import Subscription, SubscriptionError, parse, targets
+from actions.subscriptions import (
+    Subscription,
+    SubscriptionError,
+    load,
+    parse,
+    targets,
+)
 
 SCHOOL = {"subscriptions": [{"label": "Cortex/Family/School/*", "queue": "school"}]}
 
@@ -92,6 +98,25 @@ def test_refuses_to_route_back_into_its_own_queue():
             },
             "unknown event",
         ),
+        # Unhashable: `["added"] in frozenset(...)` raises TypeError rather
+        # than returning False, so without an isinstance guard this escapes as
+        # an unhandled TypeError and SIGHUP kills the router.
+        (
+            {
+                "subscriptions": [
+                    {"label": "Cortex/*", "queue": "s", "events": [["added"]]}
+                ]
+            },
+            "unknown event",
+        ),
+        (
+            {
+                "subscriptions": [
+                    {"label": "Cortex/*", "queue": "s", "events": [{"a": 1}]}
+                ]
+            },
+            "unknown event",
+        ),
     ],
 )
 def test_malformed_tables_are_fatal(doc, match):
@@ -125,3 +150,30 @@ def test_shipped_config_is_valid_and_routes_the_real_label():
 def test_subscription_is_hashable_and_frozen():
     sub = Subscription("Cortex/*", "school", frozenset({"added"}))
     assert {sub, sub} == {sub}
+
+
+def test_an_unreadable_file_is_refused_not_a_crash(tmp_path):
+    """A bad bind mount must be refusable, not fatal.
+
+    reload() catches SubscriptionError and keeps the running table; anything
+    else escapes reload() and exits the process. A `docker cp` that lands the
+    config as a directory should not take the router down.
+    """
+    d = tmp_path / "subs.yaml"
+    d.mkdir()
+    with pytest.raises(SubscriptionError, match="cannot read"):
+        load(d)
+
+
+def test_a_missing_file_still_says_so_plainly(tmp_path):
+    with pytest.raises(SubscriptionError, match="no subscriptions file"):
+        load(tmp_path / "nope.yaml")
+
+
+def test_a_valid_file_still_loads(tmp_path):
+    """The direction that must keep working."""
+    f = tmp_path / "subs.yaml"
+    f.write_text(
+        "subscriptions:\n  - label: 'Cortex/Family/School/*'\n    queue: school\n"
+    )
+    assert [s.queue for s in load(f)] == ["school"]

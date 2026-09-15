@@ -93,7 +93,10 @@ def parse(raw: Any) -> list[Subscription]:
         raw_events = entry.get("events", ["added"])
         if not isinstance(raw_events, list) or not raw_events:
             raise SubscriptionError(f"{where}: 'events' must be a non-empty list")
-        bad = [e for e in raw_events if e not in VALID_EVENTS]
+        # isinstance first: `["added"] in frozenset(...)` is a TypeError, not
+        # False, so a nested list in the YAML would escape as an unhandled
+        # TypeError instead of the SubscriptionError the caller handles.
+        bad = [e for e in raw_events if not isinstance(e, str) or e not in VALID_EVENTS]
         if bad:
             raise SubscriptionError(
                 f"{where}: unknown event(s) {bad}; valid: {sorted(VALID_EVENTS)}"
@@ -125,6 +128,15 @@ def load(path: str | Path) -> list[Subscription]:
         raw = yaml.safe_load(p.read_text())
     except FileNotFoundError as e:
         raise SubscriptionError(f"no subscriptions file at {p}") from e
+    except (OSError, UnicodeDecodeError) as e:
+        # Every way a file can refuse to be read, not just the missing one:
+        # a bind mount landing as a directory (IsADirectoryError), a mode the
+        # container user cannot read (PermissionError), a half-written file
+        # (UnicodeDecodeError). On SIGHUP the router catches SubscriptionError
+        # and keeps the table it has; anything else escapes reload() and exits
+        # the process -- so a bad `docker cp` would take the router down rather
+        # than be refused.
+        raise SubscriptionError(f"cannot read {p}: {e}") from e
     except yaml.YAMLError as e:
         raise SubscriptionError(f"{p} is not valid YAML: {e}") from e
     return parse(raw)
