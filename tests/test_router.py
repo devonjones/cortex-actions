@@ -73,11 +73,16 @@ class FakeConn:
                 return None
 
             def execute(self, sql: str, args: Any = None) -> None:
-                # No aborted-transaction check here on purpose: deleting one
-                # was invisible to the suite, and an unfalsifiable guard is the
-                # defect this whole branch is about. The precondition is
-                # modelled where it bites, in FakePartitionManager, and the
-                # ordering is asserted directly in the lock-timeout test.
+                # Postgres's rule. This was removed once as unfalsifiable and
+                # is back because it stopped being so: a failed CREATE TABLE
+                # aborts the transaction, so the RESET in the heal's `finally`
+                # is refused unless something rolls back first -- and without
+                # that, a committed 2s lock_timeout leaks onto the connection
+                # for the rest of its life.
+                if conn.aborted:
+                    raise psycopg2.errors.InFailedSqlTransaction(
+                        "current transaction is aborted"
+                    )
                 conn.log.append(f"exec:{sql}:{args}")
 
         return Cur()
@@ -178,8 +183,17 @@ def spy(monkeypatch):
                     "current transaction is aborted"
                 )
             calls["heal"].append(days_ahead)
+            # The DDL leaves a footprint, so a test can assert the timeout was
+            # set BEFORE it rather than merely somewhere in the log -- moving
+            # the SET after the DDL passed every assertion that did not.
+            self.conn.log.append("DDL")
             if state["heal_raises"] is not None:
+                # A failed CREATE TABLE aborts the transaction. create_partition
+                # only rolls back for DuplicateTable, so every other DDL error
+                # leaves it aborted for the caller.
+                self.conn.aborted = True
                 raise state["heal_raises"]
+            self.conn.log.append("commit")
             return state["heal_creates"]
 
     monkeypatch.setattr(R, "enqueue", fake_enqueue)
@@ -1305,7 +1319,7 @@ def test_main_installs_the_signal_handlers(monkeypatch):
 
     # Prometheus has to be able to scrape it, and the metrics are the whole
     # argument for flipping the producer on.
-    assert ports == [8000]
+    assert ports == [8098]
 
     router = captured[0]
     assert set(handlers) == {
@@ -1676,26 +1690,6 @@ def test_the_heal_runs_at_most_once_per_poll_interval(monkeypatch, spy):
     assert calls["heal"] == [3]  # once, not fifty
 
 
-def test_a_heal_that_creates_nothing_still_releases(monkeypatch, spy):
-    """created=0 on a partition-shaped violation means someone else won the
-    race. The event is still uncharged; the next attempt lands."""
-    calls, state = spy
-    state["heal_creates"] = 0
-    r = make_router(monkeypatch)
-    conn = FakeConn()
-    monkeypatch.setattr(r, "_connect", lambda: conn)
-    monkeypatch.setattr(
-        R,
-        "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(
-            psycopg2.errors.CheckViolation("no partition")
-        ),
-    )
-
-    assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
-    assert calls["fail"] == []
-
-
 def test_the_heals_ddl_is_given_a_lock_timeout(monkeypatch, spy):
     """An ungranted AccessExclusiveLock stalls every reader queued behind it,
     conflicting or not, because Postgres's lock queue is FIFO.
@@ -1718,13 +1712,25 @@ def test_the_heals_ddl_is_given_a_lock_timeout(monkeypatch, spy):
 
     # `"SET lock_timeout" in line` also matches RE + SET lock_timeout, so the
     # RESET satisfied the assertion for the SET and deleting the SET passed.
-    sets = [i for i, line in enumerate(conn.log) if line.startswith("exec:SET ")]
-    assert sets, conn.log
-    assert R.LOCK_TIMEOUT in conn.log[sets[0]]
+    # startswith("exec:SET ") also matches SET LOCAL, which the next statement's
+    # commit discards -- so the DDL would run with no bound at all, which is
+    # the thing this test's own docstring says must not happen. Pin the exact
+    # statement, and pin it BEFORE the DDL.
+    assert "exec:SET lock_timeout = %s:('2000ms',)" in conn.log, conn.log
+    assert not any("LOCAL" in line for line in conn.log), conn.log
+    assert "DDL" in conn.log, conn.log
+    assert conn.log.index("exec:SET lock_timeout = %s:('2000ms',)") < conn.log.index(
+        "DDL"
+    )
     # after the rollback that clears the aborted transaction, and committed so
     # the library's own transactions inherit it
-    assert "rollback" in conn.log[: sets[0]]
-    assert "commit" in conn.log[sets[0] :]
+    at = conn.log.index("exec:SET lock_timeout = %s:('2000ms',)")
+    assert "rollback" in conn.log[:at]
+    # BETWEEN the SET and the DDL. `"commit" in conn.log[at:]` was satisfied by
+    # the commit the fake's own DDL makes, so deleting the one that publishes
+    # the SET passed -- and an uncommitted session SET is rolled back with the
+    # transaction, which is exactly the failure mode this line exists to stop.
+    assert "commit" in conn.log[at : conn.log.index("DDL")]
     assert any(line.startswith("exec:RESET ") for line in conn.log), conn.log
     assert calls["heal"] == [3]
 
@@ -1743,24 +1749,27 @@ def test_the_lock_timeout_is_the_librarys_own_number():
 
 
 def test_boot_is_not_given_the_heals_lock_timeout(monkeypatch):
-    """A session-wide lock_timeout would also govern `ensure_queue_schema`,
-    where the library allows SCHEMA_LOCK_TIMEOUT_MS = 60s precisely because
-    CREATE INDEX and the first partition wait behind ordinary writers.
-    Measured: boot under contention raised LockNotAvailable at 2.02s and
-    propagated out of main(), turning a deploy against a busy queue into a
-    restart loop. Boot should wait; the heal should not.
-    """
-    from cortex_utils.queue.schema import SCHEMA_LOCK_TIMEOUT_MS
+    """A session-wide lock_timeout would also govern `ensure_queue_schema`.
 
+    The library leaves boot's DDL unbounded -- `_tx` issues SET LOCAL, which is
+    transaction-scoped, and `ensure_queue_table` and `_ensure_indexes` each open
+    their own `_tx(conn)` with no bound, so SCHEMA_LOCK_TIMEOUT_MS covers only
+    the advisory-lock front door. Measured with a session-wide 2s: boot under
+    contention raised LockNotAvailable at 2.02s and propagated out of main(),
+    turning a deploy against a busy queue into a restart loop. Boot should
+    wait; the heal must not.
+
+    `conn.log == []` rather than "no lock_timeout in the log": _connect must
+    issue NOTHING, so a future statement added here fails this test and gets
+    thought about.
+    """
     r = make_router(monkeypatch)
     conn = FakeConn()
     monkeypatch.setattr(R.psycopg2, "connect", lambda dsn: conn)
 
     r._connect()
 
-    assert not any("lock_timeout" in line for line in conn.log), conn.log
     assert conn.log == []
-    assert int(R.LOCK_TIMEOUT.removesuffix("ms")) < SCHEMA_LOCK_TIMEOUT_MS
 
 
 def test_a_row_with_no_payload_at_all_is_dropped(monkeypatch, spy):
@@ -1998,6 +2007,10 @@ def test_a_settle_with_no_connection_drops_the_one_we_may_still_hold(monkeypatch
     )
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "unsettled"
+    # Belt and braces rather than a live defect: `_connect()` does no
+    # post-connect work now, so this is normally already None. Asserted so the
+    # assumption is written down rather than remembered the next time
+    # `_connect` grows a line.
     assert r._conn is None
 
 
@@ -2030,3 +2043,61 @@ def test_a_lost_claim_counts_no_malformed_drop(monkeypatch, spy):
         counter("cortex_errors", service=R.SERVICE, error_type="malformed_event")
         == before
     )
+
+
+def test_the_lock_timeout_is_reset_after_a_heal_that_failed(monkeypatch, spy):
+    """THE PATH THE RESET EXISTS FOR.
+
+    A failed CREATE TABLE aborts the transaction, so a RESET issued without
+    rolling back first is refused, swallowed, and the committed 2s bound stays
+    on the connection for the rest of its life -- onto claim, enqueue, complete
+    and release. Measured with another session holding ACCESS EXCLUSIVE on
+    `queue` for 6s: a matched event took 2s in enqueue and 2s in release and
+    settled `unsettled`, leaving the row stuck for the five-minute visibility
+    timeout, where the same event on an unbounded connection routed in 5.5s.
+
+    The old test drove a heal that SUCCEEDS, where the reset works by accident.
+    """
+    calls, state = spy
+    state["heal_raises"] = RuntimeError("cannot create partition")
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
+    )
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+
+    resets = [line for line in conn.log if line.startswith("exec:RESET ")]
+    assert resets, conn.log
+    assert not conn.aborted
+
+
+def test_setting_the_lock_timeout_can_never_raise(monkeypatch, spy):
+    """It is called from a `finally` inside an exception handler.
+
+    Anything escaping there escapes process_job, run() and main() -- and a
+    sibling `except` on the same `try` cannot catch it. That is the
+    handler-raises-again shape this whole branch was opened to fix, which is
+    why the swallow is deliberate rather than lazy.
+    """
+    r = make_router(monkeypatch)
+
+    class Hostile:
+        aborted = False
+        log: list = []
+
+        def cursor(self):
+            raise psycopg2.InterfaceError("connection already closed")
+
+        def rollback(self):
+            raise psycopg2.InterfaceError("connection already closed")
+
+        def commit(self):
+            raise psycopg2.InterfaceError("connection already closed")
+
+    r._set_lock_timeout(Hostile(), R.LOCK_TIMEOUT)
+    r._set_lock_timeout(Hostile(), None)

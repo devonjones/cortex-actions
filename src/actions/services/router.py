@@ -92,13 +92,19 @@ DEDUP_INDEX = (
 # Naming a constant that does not govern the value is how someone later
 # "restores the match" by changing the value.)
 #
-# Deliberately NOT set on the connection: a session-wide lock_timeout would
-# also govern `ensure_queue_schema` at boot, where the library allows
-# SCHEMA_LOCK_TIMEOUT_MS = 60s precisely because CREATE INDEX and the first
-# partition wait behind ordinary writers. Measured: boot under contention
-# raised LockNotAvailable at 2.02s and propagated out of main(), turning a
-# deploy against a busy queue into a restart loop. Boot should wait; the heal
-# should not.
+# Deliberately NOT set on the connection, because a session-wide bound would
+# also govern `ensure_queue_schema` at boot. The library leaves boot's DDL
+# unbounded: `_tx` issues SET LOCAL, which is transaction-scoped, and
+# `ensure_queue_table` and `_ensure_indexes` each open their own `_tx(conn)`
+# with no bound -- SCHEMA_LOCK_TIMEOUT_MS = 60s covers only the advisory-lock
+# front door, not the CREATE TABLE or the CREATE INDEX. (Checked in the
+# library, after this comment first credited DDL_LOCK_TIMEOUT_MS, which does
+# not govern this value, and then SCHEMA_LOCK_TIMEOUT_MS, which does not govern
+# boot's DDL.) Measured: with a session-wide 2s, boot under contention raised
+# LockNotAvailable at 2.02s and propagated out of main(), turning a deploy
+# against a busy queue into a restart loop. Boot should wait; the heal must
+# not, because it holds ACCESS EXCLUSIVE on the table every service claims
+# from.
 LOCK_TIMEOUT = f"{PARTITION_LOCK_TIMEOUT_MS}ms"
 
 # Outcomes that mean this batch actually moved work. Anything else hands the
@@ -308,9 +314,10 @@ class Router:
             )
             outcome = self._complete(conn, job, "dropped")
             if outcome == "dropped":
-                # Same reason, and it matters more here: a dropped event counts
-                # `success` in QUEUE_PROCESSED, so this counter is the only
-                # metric that distinguishes a discarded event from a routed one.
+                # After the settle, like the counters below, and it matters
+                # more here: a dropped event counts `success` in
+                # QUEUE_PROCESSED, so this counter is the only metric that
+                # distinguishes a discarded event from a routed one.
                 ERRORS.labels(service=SERVICE, error_type="malformed_event").inc()
             return outcome
 
@@ -463,24 +470,31 @@ class Router:
         failing, 981 attempts in 3.09 seconds. Postgres's lock queue is FIFO,
         so an ungranted AccessExclusive stalls every later reader too, whether
         or not it conflicts with the lock actually held -- one router error
-        becoming a pipeline-wide stall. `_connect()` sets a lock_timeout for
-        the same reason.
+        becoming a pipeline-wide stall. `_set_lock_timeout` bounds it, around this
+        DDL only: a session-wide bound would reach boot, where it turned a
+        deploy against a busy queue into a restart loop.
 
         A FAILED HEAL STILL RELEASES. Charging it would dead-letter every
         matched event in three passes for an infrastructure fault -- a
         least-privilege role that cannot CREATE TABLE, a shadowed partition
         name, a lock timeout -- and those are exactly the healthy events this
         project exists not to lose. The backstop against spinning is `run()`'s
-        no-progress sleep plus this rate limit, not the attempt budget, and
-        `partition_heal_failed` is loud enough to page on.
+        no-progress sleep plus this rate limit, not the attempt budget.
+
+        `partition_heal_failed` counts ATTEMPTS, which this rate limit pins at
+        one per poll interval, so it is not a proportional signal and cannot
+        carry the alerting on its own -- the affected events show up in
+        `never_started`, one each. See README.
         """
         if time.monotonic() - self._last_heal >= self.poll_interval:
             self._last_heal = time.monotonic()
             try:
-                # The CheckViolation aborted the transaction, and the library's
-                # partition calls use bare cursors -- without this they raise
-                # InFailedSqlTransaction and every heal "fails".
-                conn.rollback()
+                # `_set_lock_timeout` rolls back first, which matters here:
+                # the CheckViolation aborted the transaction and the library's
+                # partition calls use bare cursors, so without a rollback they
+                # raise InFailedSqlTransaction and every heal "fails". One
+                # rollback, in the helper that needs it on both of its paths.
+                #
                 # A committed session SET, not SET LOCAL: `create_partition`
                 # runs its own transactions with bare cursors and sets no
                 # timeout of its own, so SET LOCAL would expire before the DDL
@@ -523,6 +537,18 @@ class Router:
         fails too.
         """
         try:
+            # ROLL BACK FIRST. A failed CREATE TABLE leaves the transaction
+            # aborted -- create_partition only rolls back for DuplicateTable --
+            # so the RESET raised InFailedSqlTransaction, this method swallowed
+            # it, and the committed 2s SET stayed on the connection for its
+            # whole life. Measured: with another session holding ACCESS
+            # EXCLUSIVE on `queue` for 6s, a matched event then took 2s in
+            # enqueue and 2s in release and settled `unsettled`, leaving the row
+            # stuck for the five-minute visibility timeout -- where the same
+            # event on an unbounded connection routed in 5.5s. The leak clears
+            # only on a later successful heal, and once the partition exists
+            # there is no later heal.
+            conn.rollback()
             with conn.cursor() as cur:
                 if value is None:
                     cur.execute("RESET lock_timeout")
@@ -565,9 +591,11 @@ class Router:
                 kind=kind,
                 error=str(exc)[:300],
             )
-            # `conn` is the local `_route` never received; `self._conn` may
-            # still hold a live object whose connect-time setup failed. Drop it
-            # rather than reuse a connection we know nothing good about.
+            # Belt and braces: `_connect()` does no post-connect work any more,
+            # so `self._conn` here is already None or closed and this is
+            # normally a no-op. It is kept because the cost is nothing and the
+            # alternative is remembering, every time `_connect` grows a line,
+            # that this path assumes it did not.
             self._drop_conn()
             return self._counted("unsettled")
         try:
@@ -742,7 +770,13 @@ def main() -> None:
     signal.signal(signal.SIGINT, on_term)
     signal.signal(signal.SIGHUP, on_hup)
 
-    start_metrics_server(port=int(os.environ.get("METRICS_PORT", "8000")))
+    # 8098: the next free port in the fleet's block (8090-8097 are taken by
+    # postmark, triage and the gateway). The default was 8000, which is outside
+    # the range `~/HomeLab/monitoring/prometheus.yml` scrapes -- and nothing
+    # scrapes this service yet either way, so `CortexHighErrorRate` cannot fire
+    # for it and the routed/suppressed reading README says to take before
+    # flipping the producer is a hand curl. See cortex-cjzf.
+    start_metrics_server(port=int(os.environ.get("METRICS_PORT", "8098")))
     router.run()
 
 

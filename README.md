@@ -124,8 +124,11 @@ ninety seconds of Postgres being away would dead-letter every event in flight.
   `CREATE TABLE … PARTITION OF` takes an AccessExclusiveLock on the parent
   `queue` table, Postgres's lock queue is FIFO, and an ungranted
   AccessExclusive stalls every reader behind it — so one router error would
-  otherwise become a pipeline-wide stall. The connection carries a 2s
-  `lock_timeout` for the same reason.
+  otherwise become a pipeline-wide stall. A 2s `lock_timeout` is set around
+  that DDL and reset afterwards. **Around the DDL only**: set on the
+  connection, it also reached `ensure_queue_schema` at boot, where the library
+  leaves DDL unbounded on purpose, and a deploy against a busy queue became a
+  restart loop.
 - **A CHECK violation naming a real constraint** — charged. Two different
   faults share SQLSTATE 23514, and the library's own predicate separates them
   on `exc.diag.constraint_name`.
@@ -143,6 +146,15 @@ again — insurance, not the primary bound. `release()` sets
 this stops is a backlog of *different* rows all failing the same way being
 walked at database round-trip speed.
 
+## Nothing scrapes this service yet
+
+`~/HomeLab/monitoring/prometheus.yml` has no job for it, so none of the metrics
+above reach Prometheus, `CortexHighErrorRate` cannot fire for the router, and
+`CortexServiceDown` (`up{job=~"cortex-.*"}`) does not cover it. The
+`routed`/`suppressed` reading this document tells you to take before flipping
+`ACTIONS_QUEUE_ENABLED` is a hand `curl` until that lands — `cortex-cjzf`.
+`METRICS_PORT` defaults to 8098, the next free port in the fleet's block.
+
 ## Deployment order matters
 
 `ACTIONS_QUEUE_ENABLED` is `false` in postmark for one reason: with no consumer,
@@ -158,7 +170,7 @@ and verify it drains before flipping that flag.**
 | `SUBSCRIPTIONS_PATH` | routing table | `/app/config/subscriptions.yaml` |
 | `BATCH_SIZE` | jobs claimed per pass | `50` |
 | `POLL_INTERVAL` | idle seconds between claims | `5` |
-| `METRICS_PORT` | Prometheus `/metrics` | `8000` |
+| `METRICS_PORT` | Prometheus `/metrics` | `8098` |
 | `LOG_LEVEL` | | `INFO` |
 
 ## Metrics
@@ -192,8 +204,10 @@ and verify it drains before flipping that flag.**
   `no_connection` one sits in `processing` until the five-minute visibility
   timeout. `partition_heal_failed` counts *heal attempts*, which are rate
   limited to one per poll interval, not affected events — so it under-reports
-  by design, and at a `POLL_INTERVAL` above 10s it falls below the fleet's
-  `rate(cortex_errors_total[5m]) > 0.1` alert threshold on its own. The events
+  by design, and at a `POLL_INTERVAL` of 10s or more it is at or below the
+  fleet's `rate(cortex_errors_total[5m]) > 0.1` alert threshold — 10s gives
+  exactly 0.1/s, and the comparison is strict, so the likeliest non-default
+  value is already silent. The events
   it describes still page through `never_started`, which is proportional.
 
 The seven-way detail behind those three statuses is in the per-batch INFO log
