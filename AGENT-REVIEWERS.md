@@ -202,6 +202,13 @@ bounded by the routing table, which is a small hand-written file.
 | `tests/**` | test-coverage |
 | `src/actions/**`, `config/subscriptions.yaml` | dead-code |
 | `Dockerfile`, `.github/workflows/**` | homelab-values |
+| `README.md`, `CLAUDE.md`, `*.md` | dead-code, plus whichever reviewer owns the behaviour being described |
+
+Documentation is in scope for every reviewer, not a category of its own: a doc
+describing behaviour someone else changed stays wrong indefinitely and reads as
+authoritative. Both of dead-code-reviewer's accepted findings on PR #1 were
+README findings, and one of them (`service="actions"` against an emitted
+`actions-router`) was a query that would have returned no series at all.
 
 ## Tooling assumed in CI
 

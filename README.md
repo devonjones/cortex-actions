@@ -108,12 +108,24 @@ ninety seconds of Postgres being away would dead-letter every event in flight.
 
 - **Infrastructure failed** (`OperationalError`, `InterfaceError`) — released,
   no attempt charged, retried after the poll interval.
-- **No partition for today** (`CheckViolation`) — the missing partition is
-  created and *then* the event is released. `enqueue(commit=False)` gives up
-  the library's own self-heal, because creating a partition needs a commit that
-  would commit our pending work, and `ensure_queue_schema` runs only at boot;
-  releasing without creating it is a livelock, not a recovery. If the heal
-  fails, the event is charged like any other failure.
+- **No partition for the row** (`CheckViolation` naming no constraint) — the
+  missing partition is created and *then* the event is released, whether or not
+  the heal worked. `enqueue(commit=False)` gives up the library's own
+  self-heal, because creating a partition needs a commit that would commit our
+  pending work, and `ensure_queue_schema` runs only at boot; releasing without
+  creating it is a livelock, not a recovery. Charging a failed heal is worse
+  still: a role that cannot `CREATE TABLE`, a shadowed partition name or a lock
+  timeout would dead-letter every matched event in three passes.
+
+  The heal runs **at most once per poll interval**, because it is DDL:
+  `CREATE TABLE … PARTITION OF` takes an AccessExclusiveLock on the parent
+  `queue` table, Postgres's lock queue is FIFO, and an ungranted
+  AccessExclusive stalls every reader behind it — so one router error would
+  otherwise become a pipeline-wide stall. The connection carries a 2s
+  `lock_timeout` for the same reason.
+- **A CHECK violation naming a real constraint** — charged. Two different
+  faults share SQLSTATE 23514, and the library's own predicate separates them
+  on `exc.diag.constraint_name`.
 - **A fault in the event** — one attempt charged, backed off, eventually
   dead-lettered.
 - **Malformed beyond repair** (no label, an id the queue cannot dedup on, a
@@ -123,9 +135,10 @@ ninety seconds of Postgres being away would dead-letter every event in flight.
   the claim's visibility timeout returns the job, uncharged.
 
 A batch in which nothing settled sleeps for the poll interval before claiming
-again. Released jobs can be re-claimed immediately, so a wholly-released batch
-would otherwise spin at database round-trip speed against the `queue` table
-every other cortex service shares.
+again — insurance, not the primary bound. `release()` sets
+`next_attempt_at = now + delay`, so a released row is already deferred; what
+this stops is a backlog of *different* rows all failing the same way being
+walked at database round-trip speed.
 
 ## Deployment order matters
 
@@ -148,7 +161,8 @@ and verify it drains before flipping that flag.**
 ## Metrics
 
 - `cortex_actions_routed_total{label_prefix,queue}` — events **enqueued**
-  downstream. Not the same as events routed: an enqueue the queue's dedup
+  downstream, counted after the transaction commits, so a rolled-back route
+  counts nothing. Not the same as events routed: an enqueue the queue's dedup
   suppressed because identical work is already pending counts below instead.
 - `cortex_actions_suppressed_total{label_prefix,queue}` — the other half.
   `routed + suppressed` is the number of (event, destination) pairs handled;
@@ -161,11 +175,12 @@ and verify it drains before flipping that flag.**
   increment per claimed job**, using the fleet's vocabulary rather than this
   service's own words, so a cross-queue expression sees this queue:
   - `success` — routed, unmatched or dropped; the job is settled and gone
-  - `error` — a fault in the event; one attempt charged
+  - `error` — one attempt charged: a fault in the event, or a CHECK violation
+    naming a real constraint
   - `skipped` — claimed but deliberately not processed: released after an
     infrastructure failure, lost to another worker, or left to the visibility
     timeout. No attempt charged, so the same job comes back.
-- `cortex_errors_total{service="actions",error_type}` — `never_started`,
+- `cortex_errors_total{service="actions-router",error_type}` — `never_started`,
   `job_failed`, `claim_lost`, `malformed_event`, `settle_error`,
   `partition_heal_failed`, `bad_subscriptions`, `claim_error`.
 

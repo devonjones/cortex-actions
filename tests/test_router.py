@@ -1,8 +1,14 @@
 """Router behaviour, with the queue library stubbed.
 
 What matters here is not the SQL -- cortex_utils.queue owns and tests that --
-but the four decisions this service makes: route, drop silently, drop loudly,
-and give the claim back. Each has a different failure cost.
+but what each outcome COSTS THE EVENT. `routed`, `unmatched` and `dropped`
+settle it; `failed` charges an attempt toward dead_letter; `released`, `lost`
+and `unsettled` hand it back uncharged. Getting that wrong in either direction
+retires healthy work or re-queues broken work forever.
+
+Every stub here matches the real signature AND defaults of what it replaces --
+see `test_the_stubs_match_the_library`. The suite this grew out of passed
+against a job shape `claim()` has never returned.
 """
 
 import datetime
@@ -47,6 +53,21 @@ class FakeConn:
         self.closes += 1
         self.closed = True
 
+    def cursor(self) -> Any:
+        conn = self
+
+        class Cur:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *a: Any) -> None:
+                return None
+
+            def execute(self, sql: str, args: Any = None) -> None:
+                conn.log.append(f"exec:{sql}:{args}")
+
+        return Cur()
+
     @property
     def commits(self) -> int:
         return self.log.count("commit")
@@ -78,17 +99,26 @@ def spy(monkeypatch):
         "release_returns": True,
         "fail_returns": "pending",
         "heal_raises": None,
+        "heal_creates": 1,
     }
 
     def fake_enqueue(
         conn, queue_name, payload, priority=0, dedup_key=None, commit=True
     ):
         conn.log.append(f"enqueue:{queue_name}")
+        # The real one commits when asked. A fake that ignores the flag makes
+        # the atomicity assertion rest on the flag alone, and the ordering log
+        # -- the thing that is supposed to catch a commit in the wrong place --
+        # cannot see the mutation its own docstring names.
+        if commit:
+            conn.commit()
         calls["enqueue"].append((queue_name, payload, dedup_key, commit, priority))
         return 1
 
     def fake_complete(conn, job_id, worker, commit=True):
         conn.log.append("complete")
+        if commit:
+            conn.commit()
         calls["complete"].append((job_id, worker, commit))
         return state["complete_returns"]
 
@@ -109,14 +139,30 @@ def spy(monkeypatch):
         return state["release_returns"]
 
     class FakePartitionManager:
+        """Stands in for the real one, including its preconditions.
+
+        The real `create_partition` runs bare cursors and commits. A
+        CheckViolation has aborted the transaction, so without the caller's
+        rollback first the real thing raises InFailedSqlTransaction and every
+        heal 'fails' -- which is why this fake refuses to work if the rollback
+        did not happen. A fake with no preconditions made that rollback
+        deletable with the suite green.
+        """
+
         def __init__(self, conn):
             self.conn = conn
 
         def create_future_partitions(self, days_ahead=3, dry_run=False, days_back=0):
+            # Unconditional: an empty log means no rollback happened either,
+            # and `if self.conn.log and ...` let exactly that through.
+            if not self.conn.log or self.conn.log[-1] != "rollback":
+                raise psycopg2.errors.InFailedSqlTransaction(
+                    "current transaction is aborted"
+                )
             calls["heal"].append(days_ahead)
             if state["heal_raises"] is not None:
                 raise state["heal_raises"]
-            return 1
+            return state["heal_creates"]
 
     monkeypatch.setattr(R, "enqueue", fake_enqueue)
     monkeypatch.setattr(R, "complete", fake_complete)
@@ -635,11 +681,20 @@ def test_the_stubs_match_the_library(spy):
         ("complete", Q.complete),
         ("fail_or_retry", Q.fail_or_retry),
         ("release", Q.release),
+        ("claim", Q.claim),
+        ("ensure_queue_schema", Q.ensure_queue_schema),
     ]:
         stub = getattr(R, name)
-        assert [p.name for p in inspect.signature(stub).parameters.values()] == [
-            p.name for p in inspect.signature(real).parameters.values()
-        ], name
+        if stub is real:
+            continue  # not stubbed in this test's fixture
+        ours = list(inspect.signature(stub).parameters.values())
+        theirs = list(inspect.signature(real).parameters.values())
+        assert [p.name for p in ours] == [p.name for p in theirs], name
+        # AND the defaults. `commit=True` in the library with `commit=False` in
+        # the fake means the atomicity assertion rests on a default nothing
+        # checks -- a production call that stopped passing commit=False would
+        # still land in a fake that behaves atomically.
+        assert [p.default for p in ours] == [p.default for p in theirs], name
 
 
 # -- the missing partition -------------------------------------------------
@@ -670,8 +725,12 @@ def test_a_missing_partition_is_healed_before_the_job_is_handed_back(monkeypatch
     assert calls["fail"] == []
 
 
-def test_a_heal_that_fails_charges_the_attempt(monkeypatch, spy):
-    """Releasing what we cannot make good on is the livelock again."""
+def test_a_heal_that_fails_still_releases(monkeypatch, spy):
+    """Charging it would dead-letter every matched event in three passes for
+    an infrastructure fault -- a role that cannot CREATE TABLE, a shadowed
+    partition name, a lock timeout. Those are the healthy events this project
+    exists not to lose. The backstop against spinning is the rate limit and
+    run()'s no-progress sleep, not the attempt budget."""
     calls, state = spy
     state["heal_raises"] = RuntimeError("cannot create partition")
     r = make_router(monkeypatch)
@@ -685,9 +744,13 @@ def test_a_heal_that_fails_charges_the_attempt(monkeypatch, spy):
         ),
     )
 
-    assert r.process_job(event("Cortex/Family/School/DPS")) == "failed"
-    assert calls["release"] == []
-    assert calls["fail"]
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+    assert calls["fail"] == []
+    assert calls["release"] == [(1, r.poll_interval)]
+    assert (
+        counter("cortex_errors", service=R.SERVICE, error_type="partition_heal_failed")
+        > 0
+    )
 
 
 # -- the connection ---------------------------------------------------------
@@ -983,10 +1046,13 @@ def test_claim_asks_for_what_the_router_was_configured_with(monkeypatch, spy):
 
 
 def test_a_batch_that_settles_nothing_backs_off(monkeypatch, spy):
-    """THE SPIN. released/lost/unsettled all hand the job back uncharged, so
-    the next claim returns the same rows. Sleeping only on an empty batch meant
-    a wholly-released batch ran at database round-trip speed against the table
-    every other cortex service claims from."""
+    """Insurance against walking a backlog of rows that all fail the same way.
+
+    Not against re-claiming the SAME rows -- `release()` defers them by
+    `next_attempt_at` -- which is why the original measurement behind this
+    guard was a stub artefact. The real case is 82k pending events and a fault
+    that hits every one of them.
+    """
     _, _ = spy
     r = make_router(monkeypatch)
     conn = FakeConn()
@@ -1144,15 +1210,23 @@ def test_sleep_wakes_for_stop_and_for_reload(monkeypatch):
 # -- main() -----------------------------------------------------------------
 
 
-def test_main_refuses_to_start_without_its_environment(monkeypatch):
-    """A router that boots with no password connects to nothing, forever."""
+@pytest.mark.parametrize(
+    "missing",
+    ["POSTGRES_HOST", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"],
+)
+def test_main_refuses_to_start_without_its_environment(monkeypatch, missing):
+    """One variable at a time: deleting all four and asserting on one left the
+    other three's presence in the check unconstrained -- dropping
+    POSTGRES_PASSWORD from it passed. A router that boots with no password
+    connects to nothing, forever."""
     for v in ("POSTGRES_HOST", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"):
-        monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv(v, "x")
+    monkeypatch.delenv(missing)
 
     with pytest.raises(SystemExit) as e:
         R.main()
 
-    assert "POSTGRES_HOST" in str(e.value)
+    assert missing in str(e.value)
 
 
 def test_main_refuses_to_start_on_a_bad_routing_table(monkeypatch):
@@ -1178,7 +1252,6 @@ def test_main_installs_the_signal_handlers(monkeypatch):
     for v in ("POSTGRES_HOST", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"):
         monkeypatch.setenv(v, "x")
     monkeypatch.setattr(R, "load", lambda path: SUBS)
-    monkeypatch.setattr(R, "start_metrics_server", lambda port: None)
 
     handlers: dict[int, Any] = {}
     monkeypatch.setattr(
@@ -1186,8 +1259,14 @@ def test_main_installs_the_signal_handlers(monkeypatch):
     )
 
     captured: list[R.Router] = []
+    ports: list[int] = []
+    monkeypatch.setattr(R, "start_metrics_server", lambda port: ports.append(port))
     monkeypatch.setattr(R.Router, "run", lambda self: captured.append(self))
     R.main()
+
+    # Prometheus has to be able to scrape it, and the metrics are the whole
+    # argument for flipping the producer on.
+    assert ports == [8000]
 
     router = captured[0]
     assert set(handlers) == {
@@ -1220,34 +1299,388 @@ def test_every_outcome_has_a_fleet_status_and_a_place_in_the_summary():
     assert set(R._ERROR_TYPE.values()) == {"never_started", "job_failed"}
 
 
-@pytest.mark.parametrize(
-    "outcome",
-    ["routed", "unmatched", "dropped", "failed", "released", "lost", "unsettled"],
-)
+def produce(r, outcome, monkeypatch, spy):
+    """Drive the router to one real outcome, through process_job."""
+    calls, state = spy
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+
+    def boom(exc):
+        monkeypatch.setattr(R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(exc))
+
+    if outcome == "routed":
+        return r.process_job(event("Cortex/Family/School/DPS"))
+    if outcome == "unmatched":
+        return r.process_job(event("Cortex/Automated/Social/X"))
+    if outcome == "dropped":
+        return r.process_job(job({"gmail_id": "abc"}))
+    if outcome == "failed":
+        boom(RuntimeError("boom"))
+        return r.process_job(event("Cortex/Family/School/DPS"))
+    if outcome == "released":
+        boom(psycopg2.OperationalError("gone"))
+        return r.process_job(event("Cortex/Family/School/DPS"))
+    if outcome == "lost":
+        state["complete_returns"] = False
+        return r.process_job(event("Cortex/Family/School/DPS"))
+    if outcome == "unsettled":
+        monkeypatch.setattr(
+            r,
+            "_connect",
+            lambda: (_ for _ in ()).throw(psycopg2.OperationalError("no server")),
+        )
+        return r.process_job(event("Cortex/Family/School/DPS"))
+    raise AssertionError(outcome)
+
+
+@pytest.mark.parametrize("outcome", R.OUTCOMES)
 def test_each_outcome_counts_exactly_one_claimed_job(monkeypatch, spy, outcome):
-    """Every claimed job increments cortex_queue_processed_total exactly once.
-    Three settle paths used to carry their own copy of that decision and only
-    one of them did it, so the metric saw a third of the traffic."""
+    """Driven through `process_job`, not by calling the counter directly.
+
+    The previous version of this test called `_counted` and asserted `_counted`
+    increments -- so four of the five settle returns could stop calling it with
+    the suite green. The defect it describes was in the callers, which is the
+    same shape as the P0 this PR exists to fix: a test agreeing with the code
+    instead of constraining it.
+    """
+    r = make_router(monkeypatch)
+    before = {
+        st: counter("cortex_queue_processed", queue=R.SOURCE_QUEUE, status=st)
+        for st in ("success", "error", "skipped")
+    }
+
+    assert produce(r, outcome, monkeypatch, spy) == outcome
+
+    after = {
+        st: counter("cortex_queue_processed", queue=R.SOURCE_QUEUE, status=st)
+        for st in ("success", "error", "skipped")
+    }
+    moved = {st: after[st] - before[st] for st in after}
+    assert sum(moved.values()) == 1, moved
+    assert moved[R._STATUS[outcome]] == 1
+
+
+@pytest.mark.parametrize(
+    "outcome,error_type",
+    [("released", "never_started"), ("failed", "job_failed")],
+)
+def test_the_error_type_is_the_fleets_word(monkeypatch, spy, outcome, error_type):
+    """`_ERROR_TYPE` was asserted as a set, so every individual mapping was
+    free to be wrong -- and nothing read an ERRORS label at all."""
+    r = make_router(monkeypatch)
+    before = counter("cortex_errors", service=R.SERVICE, error_type=error_type)
+
+    produce(r, outcome, monkeypatch, spy)
+
+    assert counter("cortex_errors", service=R.SERVICE, error_type=error_type) == (
+        before + 1
+    )
+
+
+@pytest.mark.parametrize("outcome,status", [(o, R._STATUS[o]) for o in R.OUTCOMES])
+def test_each_outcome_maps_to_the_status_it_should(outcome, status):
+    """Asserting the two sets are equal left every individual mapping free:
+    `lost -> success` and `dropped -> error` both passed."""
+    expected = {
+        "routed": "success",
+        "unmatched": "success",
+        "dropped": "success",
+        "failed": "error",
+        "released": "skipped",
+        "lost": "skipped",
+        "unsettled": "skipped",
+    }
+    assert R._STATUS[outcome] == expected[outcome] == status
+
+
+# -- the counters that measure the sweep ------------------------------------
+
+
+def test_routing_increments_routed_not_suppressed(monkeypatch, spy):
+    """Nothing asserted these move at all -- both `.inc()` calls could be
+    deleted with the suite green, and these two counters are the pair README
+    says to read before switching the producer on."""
     _, _ = spy
-    before = sum(
-        counter("cortex_queue_processed", queue=R.SOURCE_QUEUE, status=st)
-        for st in ("success", "error", "skipped")
+    r = make_router(monkeypatch)
+    before = counter(
+        "cortex_actions_routed", label_prefix="Cortex/Family", queue="school"
+    )
+    before_s = counter(
+        "cortex_actions_suppressed", label_prefix="Cortex/Family", queue="school"
     )
 
-    R.Router._counted(outcome)
+    r._route(FakeConn(), event("Cortex/Family/School/DPS"))
 
-    after = sum(
-        counter("cortex_queue_processed", queue=R.SOURCE_QUEUE, status=st)
-        for st in ("success", "error", "skipped")
+    assert (
+        counter("cortex_actions_routed", label_prefix="Cortex/Family", queue="school")
+        == before + 1
     )
-    assert after == before + 1
+    assert (
+        counter(
+            "cortex_actions_suppressed", label_prefix="Cortex/Family", queue="school"
+        )
+        == before_s
+    )
+
+
+def test_an_unmatched_label_increments_unmatched(monkeypatch, spy):
+    _, _ = spy
+    r = make_router(monkeypatch)
+    before = counter("cortex_actions_unmatched", label_prefix="Cortex/Automated")
+
+    r._route(FakeConn(), event("Cortex/Automated/Social/X"))
+
+    assert (
+        counter("cortex_actions_unmatched", label_prefix="Cortex/Automated")
+        == before + 1
+    )
+
+
+def test_metrics_carry_the_prefix_and_never_the_full_label(monkeypatch, spy):
+    """CLAUDE.md forbids this by name: triage rules mint labels with
+    interpolated variables, so a full-label dimension grows a series per email.
+    Passing `label` instead of `prefix` survived every previous test."""
+    _, _ = spy
+    r = make_router(monkeypatch)
+    label = "Cortex/Automated/Social/Nextdoor/Thread/12345"
+
+    r._route(FakeConn(), event(label))
+
+    assert counter("cortex_actions_unmatched", label_prefix="Cortex/Automated") > 0
+    assert counter("cortex_actions_unmatched", label_prefix=label) == 0
+
+
+def test_a_rolled_back_route_counts_no_enqueues(monkeypatch, spy):
+    """`routed` must be enqueues that are DURABLE. Counting inside the
+    transaction inflates it exactly when the router is struggling, and the
+    retry counts them again."""
+    _, state = spy
+    state["complete_returns"] = False
+    r = make_router(monkeypatch)
+    before = counter(
+        "cortex_actions_routed", label_prefix="Cortex/Family", queue="school"
+    )
+
+    assert r._route(FakeConn(), event("Cortex/Family/School/DPS")) == "lost"
+
+    assert (
+        counter("cortex_actions_routed", label_prefix="Cortex/Family", queue="school")
+        == before
+    )
+
+
+# -- the sleep itself -------------------------------------------------------
+
+
+def test_sleep_actually_sleeps_in_one_second_ticks(monkeypatch):
+    """The backoff was asserted through a stub of itself.
+
+    Both backoff tests monkeypatch `_sleep` and count calls, and the only test
+    touching the real method set a stop flag first -- so the loop body never
+    ran, and `_sleep -> return`, `range(poll_interval) -> range(1)` and
+    `sleep(1) -> sleep(0)` all survived. One-second ticks are the reason a
+    SIGTERM lands promptly instead of after a whole poll interval.
+    """
+    r = make_router(monkeypatch)
+    r.poll_interval = 7
+    slept: list[float] = []
+    monkeypatch.setattr(R.time, "sleep", lambda s: slept.append(s))
+
+    r._sleep()
+
+    assert slept == [1] * 7
+
+
+def test_sleep_stops_early_when_asked_to_stop(monkeypatch):
+    r = make_router(monkeypatch)
+    r.poll_interval = 10
+    slept: list[float] = []
+
+    def tick(s):
+        slept.append(s)
+        if len(slept) == 3:
+            r._stop.set()
+
+    monkeypatch.setattr(R.time, "sleep", tick)
+    r._sleep()
+
+    assert slept == [1, 1, 1]
+
+
+def test_sleep_stops_early_for_a_reload(monkeypatch):
+    r = make_router(monkeypatch)
+    r.poll_interval = 10
+    slept: list[float] = []
+
+    def tick(s):
+        slept.append(s)
+        if len(slept) == 2:
+            r.request_reload()
+
+    monkeypatch.setattr(R.time, "sleep", tick)
+    r._sleep()
+
+    assert slept == [1, 1]
+
+
+@pytest.mark.parametrize("member", ["routed", "unmatched", "dropped", "failed"])
+def test_every_progress_member_disarms_the_backoff(monkeypatch, spy, member):
+    """`PROGRESS <= OUTCOMES` left the interior free, and parametrising over
+    PROGRESS itself only restated it. These four are spelled out: dropping
+    `unmatched` -- the overwhelming majority path, by `_route`'s own comment --
+    would idle a poll interval after almost every batch, adding hours to the
+    82,288-message sweep, with nothing failing.
+    """
+    r = make_router(monkeypatch)
+    slept: list[int] = []
+    monkeypatch.setattr(r, "_sleep", lambda: slept.append(1))
+    monkeypatch.setattr(R, "ensure_queue_schema", lambda c, extra_indexes=(): None)
+    conn = FakeConn()
+
+    outcomes = {
+        "routed": event("Cortex/Family/School/DPS"),
+        "unmatched": event("Cortex/Automated/Social/X"),
+        "dropped": job({"gmail_id": "abc"}),
+        "failed": event("Cortex/Family/School/DPS"),
+    }
+    if member == "failed":
+        monkeypatch.setattr(
+            R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+
+    drive(monkeypatch, r, [[outcomes[member]], []], conn=conn)
+
+    assert member in R.PROGRESS
+    assert len(slept) == 1  # the empty batch only
+
+
+@pytest.mark.parametrize("member", ["released", "lost", "unsettled"])
+def test_no_outcome_that_hands_the_job_back_counts_as_progress(member):
+    """The other direction, and the one that matters: an outcome that returns
+    the job uncharged must never disarm the backoff."""
+    assert member not in R.PROGRESS
+
+
+# -- the partition heal -----------------------------------------------------
+
+
+def test_a_named_constraint_violation_is_a_fault_not_an_outage(monkeypatch, spy):
+    """Two faults share SQLSTATE 23514. `queue_valid_status` is a real named
+    CHECK on the deployed schema; treating it as a missing partition released
+    it forever, uncharged and never dead-lettered."""
+    calls, _ = spy
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+
+    exc = psycopg2.errors.CheckViolation("status check")
+    monkeypatch.setattr(
+        type(exc),
+        "diag",
+        property(lambda self: _Diag("queue_valid_status")),
+        raising=False,
+    )
+    monkeypatch.setattr(R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(exc))
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "failed"
+    assert calls["heal"] == []
+    assert calls["fail"]
+
+
+class _Diag:
+    def __init__(self, name):
+        self.constraint_name = name
+
+
+def test_the_heal_rolls_back_before_it_runs_ddl(monkeypatch, spy):
+    """The CheckViolation aborted the transaction and the library's partition
+    calls use bare cursors, so without the rollback every heal raises
+    InFailedSqlTransaction -- and then every heal 'fails'."""
+    calls, _ = spy
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        lambda *a, **k: (_ for _ in ()).throw(
+            psycopg2.errors.CheckViolation("no partition")
+        ),
+    )
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+    assert calls["heal"] == [3]
+    # rollback precedes the DDL, and the fake refuses to work otherwise
+    assert "rollback" in conn.log
+
+
+def test_the_heal_runs_at_most_once_per_poll_interval(monkeypatch, spy):
+    """CREATE TABLE ... PARTITION OF takes an AccessExclusiveLock on the parent
+    `queue` table every cortex service claims from. Once per failing job is
+    once per job in the backlog -- measured at 981 attempts in 3.09s against a
+    real Postgres, with a FIFO lock queue stalling every reader behind it."""
+    calls, _ = spy
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        lambda *a, **k: (_ for _ in ()).throw(
+            psycopg2.errors.CheckViolation("no partition")
+        ),
+    )
+
+    for _ in range(50):
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+
+    assert calls["heal"] == [3]  # once, not fifty
+
+
+def test_a_heal_that_creates_nothing_still_releases(monkeypatch, spy):
+    """created=0 on a partition-shaped violation means someone else won the
+    race. The event is still uncharged; the next attempt lands."""
+    calls, state = spy
+    state["heal_creates"] = 0
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        lambda *a, **k: (_ for _ in ()).throw(
+            psycopg2.errors.CheckViolation("no partition")
+        ),
+    )
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+    assert calls["fail"] == []
+
+
+def test_the_connection_is_given_a_lock_timeout(monkeypatch):
+    """An ungranted AccessExclusiveLock stalls every reader queued behind it,
+    conflicting or not. The library sets the same on its own write-path heal."""
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(R.psycopg2, "connect", lambda dsn: conn)
+
+    r._connect()
+
+    assert any(
+        "SET lock_timeout" in line and R.LOCK_TIMEOUT in line for line in conn.log
+    ), conn.log
 
 
 def test_a_row_with_no_payload_at_all_is_dropped(monkeypatch, spy):
     """`payload` is NOT NULL in the queue table, so this is defensive -- but
     the defence is one `.get`, and without it the KeyError lands in the generic
     handler and charges three attempts into dead_letter for a row that could
-    never have been routed."""
+    never have been routed.
+
+    (This test existed, was lost to an edit, and was found again by re-running
+    the previous round's mutation set. A green suite is not proof the tests are
+    still there.)
+    """
     calls, _ = spy
     r = make_router(monkeypatch)
     row = job({})

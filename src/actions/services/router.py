@@ -41,6 +41,7 @@ from cortex_utils.queue import (
     release,
     worker_identity,
 )
+from cortex_utils.queue.ops import _is_missing_partition as is_missing_partition
 from cortex_utils.queue.ops import is_dedup_value
 from prometheus_client import Counter
 
@@ -84,6 +85,15 @@ DEDUP_INDEX = (
     "WHERE status IN ('pending', 'processing')",
 )
 
+# Matches cortex_utils.queue's own DDL_LOCK_TIMEOUT_MS. Long enough for an
+# uncontended lock, short enough that a stalled router does not stall the
+# pipeline behind it.
+LOCK_TIMEOUT = "2s"
+
+# Outcomes that mean this batch actually moved work. Anything else hands the
+# job back uncharged, so the same rows can come straight back -- see run().
+PROGRESS = ("routed", "unmatched", "dropped", "failed")
+
 # EVERY claimed job increments `cortex_queue_processed_total` exactly once, and
 # the value comes from here. The vocabulary is the fleet's, not this service's:
 # cortex_utils.metrics documents `status` as success | error | skipped, and the
@@ -92,10 +102,6 @@ DEDUP_INDEX = (
 # queues -- an `actions` row that reads 0 errors forever. The seven-way detail
 # is not lost, it just belongs in the batch log and in ERRORS, which are keyed
 # per service and cost nothing to widen.
-# Outcomes that mean this batch actually moved work. Anything else hands the
-# job back uncharged, so the same rows can come straight back -- see run().
-PROGRESS = ("routed", "unmatched", "dropped", "failed")
-
 _STATUS = {
     "routed": "success",
     "unmatched": "success",
@@ -153,7 +159,6 @@ def _label_prefix(label: str) -> str:
 _NEVER_STARTED = (
     psycopg2.OperationalError,  # connection gone, server restarting
     psycopg2.InterfaceError,  # connection already closed
-    psycopg2.errors.CheckViolation,  # no partition for today: see below
 )
 
 
@@ -168,6 +173,7 @@ class Router:
         self._reload_requested = threading.Event()
         self.subscriptions: list[Subscription] = load(subs_path)
         self._conn: Any = None
+        self._last_heal = float("-inf")
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -201,6 +207,16 @@ class Router:
     def _connect(self) -> Any:
         if self._conn is None or self._conn.closed:
             self._conn = psycopg2.connect(self.dsn)
+            with self._conn.cursor() as cur:
+                # Never wait indefinitely for a lock on the shared `queue`
+                # table. The partition heal runs DDL, which takes an
+                # AccessExclusiveLock on the parent, and Postgres's lock queue
+                # is FIFO -- an ungranted AccessExclusive stalls every reader
+                # behind it, conflicting or not. The library sets exactly this
+                # on its own write-path heal (DDL_LOCK_TIMEOUT_MS); a router
+                # doing DDL on an error path needs it more, not less.
+                cur.execute("SET lock_timeout = %s", (LOCK_TIMEOUT,))
+            self._conn.commit()
         return self._conn
 
     def _ensure_schema(self) -> None:
@@ -311,6 +327,7 @@ class Router:
             logger.debug("no subscription", label=label, event_type=event_type)
             return self._complete(conn, job, "unmatched")
 
+        enqueued: list[tuple[str, bool]] = []
         for queue_name in queues:
             # None is not failure: it means an identical job is already pending
             # or processing on that queue, so the work is covered. Counting it
@@ -325,14 +342,20 @@ class Router:
                 dedup_key=DEDUP_KEY,
                 commit=False,
             )
-            if job_id is None:
-                SUPPRESSED.labels(label_prefix=prefix, queue=queue_name).inc()
-            else:
-                ROUTED.labels(label_prefix=prefix, queue=queue_name).inc()
+            enqueued.append((queue_name, job_id is None))
 
         outcome = self._complete(conn, job, "routed")
-        if outcome == "routed":
-            logger.info("routed", label=label, event_type=event_type, queues=queues)
+        if outcome != "routed":
+            # Rolled back. Counting these would inflate `routed` exactly when
+            # the router is struggling, and the retry counts them again -- and
+            # `routed` is the number README says to read before switching the
+            # producer on.
+            return outcome
+
+        for queue_name, suppressed in enqueued:
+            metric = SUPPRESSED if suppressed else ROUTED
+            metric.labels(label_prefix=prefix, queue=queue_name).inc()
+        logger.info("routed", label=label, event_type=event_type, queues=queues)
         return outcome
 
     def _complete(self, conn: Any, job: dict[str, Any], outcome: str) -> str:
@@ -376,6 +399,18 @@ class Router:
         try:
             conn = self._connect()
             return self._route(conn, job)
+        except psycopg2.errors.CheckViolation as e:
+            # TWO DIFFERENT FAULTS SHARE SQLSTATE 23514, and treating them alike
+            # was wrong in both directions: a genuine violation released forever
+            # and never dead-lettered, a missing partition charged and
+            # dead-lettered healthy events. The library already owns the
+            # predicate -- `enqueue()` itself gates its self-heal on it -- and
+            # it keys on `exc.diag.constraint_name` rather than message text,
+            # which is locale-dependent and reworded between Postgres versions.
+            # `queue_valid_status` is a real named CHECK on the deployed schema.
+            if not is_missing_partition(e):
+                return self._settle(conn, job, e, kind="failed")
+            return self._heal_partition_then_settle(conn, job, e)
         except _NEVER_STARTED as e:
             # THE WORK NEVER STARTED, so the event must not be charged.
             #
@@ -386,8 +421,6 @@ class Router:
             # ninety seconds of Postgres being unreachable would dead-letter
             # every school event in flight -- filling dead_letter with exactly
             # the healthy events this project exists to never lose.
-            if isinstance(e, psycopg2.errors.CheckViolation):
-                return self._heal_partition_then_settle(conn, job, e)
             return self._settle(conn, job, e, kind="released")
         except Exception as e:  # noqa: BLE001 - the loop must survive one bad job
             return self._settle(conn, job, e, kind="failed")
@@ -395,43 +428,56 @@ class Router:
     def _heal_partition_then_settle(
         self, conn: Any, job: dict[str, Any], exc: Exception
     ) -> str:
-        """Create the missing partition, then hand the job back.
+        """Create the missing partition, at most once per poll interval, then
+        hand the job back uncharged whether or not the heal worked.
 
-        A release with nothing fixed is a LIVELOCK, not a recovery. enqueue()
-        self-heals a missing partition by creating it and retrying -- except
-        under `commit=False`, which we pass so the enqueues and the completion
-        settle atomically, and which deliberately gives that up because
-        creating a partition needs a commit that would commit the caller's
-        pending work. `ensure_queue_schema` runs once at boot. So nothing else
-        in this process ever creates tomorrow's partition, `release` charges no
-        attempt, and the same job comes back every poll interval forever, at
-        zero throughput, writing to the table every other cortex service claims
-        from. Measured driving run(): 501 iterations, 5000 releases, 1 sleep.
+        A release with nothing fixed is a LIVELOCK: enqueue() self-heals a
+        missing partition, except under `commit=False`, which we pass so the
+        enqueues and the completion settle atomically, and which deliberately
+        gives that up because creating a partition needs a commit that would
+        commit the caller's pending work. `ensure_queue_schema` runs once at
+        boot. So nothing else in this process ever creates tomorrow's
+        partition.
 
-        The heal is on its own transaction, after the rollback, so it commits
-        nothing of ours. If the heal itself fails the fault is not transient
-        and the job is charged an attempt like any other failure -- a release
-        we cannot make good on is the livelock again.
+        RATE LIMITED, because the heal is DDL. `CREATE TABLE ... PARTITION OF`
+        takes an AccessExclusiveLock on the parent `queue` table that every
+        other cortex service claims from, and once per failing job is once per
+        job in the backlog: measured against a real Postgres with the heal
+        failing, 981 attempts in 3.09 seconds. Postgres's lock queue is FIFO,
+        so an ungranted AccessExclusive stalls every later reader too, whether
+        or not it conflicts with the lock actually held -- one router error
+        becoming a pipeline-wide stall. `_connect()` sets a lock_timeout for
+        the same reason.
+
+        A FAILED HEAL STILL RELEASES. Charging it would dead-letter every
+        matched event in three passes for an infrastructure fault -- a
+        least-privilege role that cannot CREATE TABLE, a shadowed partition
+        name, a lock timeout -- and those are exactly the healthy events this
+        project exists not to lose. The backstop against spinning is `run()`'s
+        no-progress sleep plus this rate limit, not the attempt budget, and
+        `partition_heal_failed` is loud enough to page on.
         """
-        if conn is None:
-            return self._settle(conn, job, exc, kind="released")
-        try:
-            conn.rollback()
-            created = PartitionManager(conn).create_future_partitions(days_ahead=3)
-            logger.warning(
-                "created missing queue partitions after a CheckViolation",
-                job_id=job.get("id"),
-                created=created,
-            )
-        except Exception as heal_exc:  # noqa: BLE001 - see the docstring
-            ERRORS.labels(service=SERVICE, error_type="partition_heal_failed").inc()
-            logger.error(
-                "could not create the missing partition; charging the attempt",
-                job_id=job.get("id"),
-                error=str(exc)[:300],
-                heal_error=str(heal_exc)[:300],
-            )
-            return self._settle(conn, job, exc, kind="failed")
+        if time.monotonic() - self._last_heal >= self.poll_interval:
+            self._last_heal = time.monotonic()
+            try:
+                # The CheckViolation aborted the transaction, and the library's
+                # partition calls use bare cursors -- without this they raise
+                # InFailedSqlTransaction and every heal "fails".
+                conn.rollback()
+                created = PartitionManager(conn).create_future_partitions(days_ahead=3)
+                logger.warning(
+                    "created missing queue partitions",
+                    job_id=job.get("id"),
+                    created=created,
+                )
+            except Exception as heal_exc:  # noqa: BLE001 - see the docstring
+                ERRORS.labels(service=SERVICE, error_type="partition_heal_failed").inc()
+                logger.error(
+                    "could not create the missing partition",
+                    job_id=job.get("id"),
+                    error=str(exc)[:300],
+                    heal_error=str(heal_exc)[:300],
+                )
         return self._settle(conn, job, exc, kind="released")
 
     def _settle(
@@ -563,17 +609,18 @@ class Router:
                 **{k: tally[k] for k in OUTCOMES if tally[k]},
             )
 
-            # A BATCH THAT SETTLED NOTHING MUST SLEEP.
+            # A BATCH THAT SETTLED NOTHING SLEEPS. Insurance, not the
+            # primary bound, and the distinction is worth stating because the
+            # measurement that first motivated this line was an artefact:
+            # `release()` sets `next_attempt_at = now + delay`, and `claim()`
+            # filters on it, so a released row is ALREADY deferred and a
+            # stubbed claim that ignores that column exaggerates the spin.
             #
-            # `released`, `lost` and `unsettled` all put the job back without
-            # charging it, so the next claim can return the very same rows.
-            # Sleeping only on an empty batch means a wholly-released batch
-            # spins at database round-trip speed: measured driving run() with a
-            # missing partition, 501 iterations, 5000 releases and one sleep --
-            # ~166k row UPDATEs per pass, back to back, against the `queue`
-            # table every other cortex service claims from. The poll interval
-            # is the backstop for every not-started case, not just for an idle
-            # queue.
+            # What it does bound is a backlog of DIFFERENT rows all failing the
+            # same way -- a missing partition across 82k pending events -- being
+            # walked at database round-trip speed. That one is real: 981 heal
+            # attempts in 3.09s against a real Postgres, before the rate limit
+            # in `_heal_partition_then_settle` existed.
             if not any(tally[k] for k in PROGRESS):
                 logger.warning(
                     "no progress in this batch, backing off", claimed=len(jobs)

@@ -245,16 +245,45 @@ def test_a_blank_queue_is_refused(queue):
         parse({"subscriptions": [{"label": "Cortex/*", "queue": queue}]})
 
 
-def test_matching_uses_the_case_sensitive_matcher_by_construction():
-    """`fnmatch` lowercases through os.path.normcase -- which is the identity
-    on POSIX, so on this host no input can tell the two apart. The behaviour
-    is real on a case-insensitive filesystem and the difference matters
-    (`Cortex/Family` and `cortex/family` are different Gmail labels), so assert
-    the choice structurally rather than shipping a test that cannot fail.
+def test_malformed_yaml_is_refused_not_raised(tmp_path):
+    """An indentation typo must be a refused reload, not a crash-loop.
+
+    reload() catches SubscriptionError and keeps the running table; a bare
+    yaml.YAMLError escapes it, run() and main(). Nothing put malformed YAML
+    through load() before, so the conversion was deletable.
     """
-    import inspect
+    f = tmp_path / "subs.yaml"
+    f.write_text("subscriptions:\n  - label: 'Cortex/*'\n   queue: school\n")
+    with pytest.raises(SubscriptionError, match="not valid YAML"):
+        load(f)
+
+
+def test_a_binary_file_is_refused_not_raised(tmp_path):
+    f = tmp_path / "subs.yaml"
+    f.write_bytes(b"\xff\xfe\x00\x01 not text")
+    with pytest.raises(SubscriptionError, match="cannot read|not valid YAML"):
+        load(f)
+
+
+def test_matching_does_not_go_through_the_case_folding_matcher(monkeypatch):
+    """Behavioural, not a source-text check.
+
+    `fnmatch.fnmatch` lowercases through os.path.normcase, which is the
+    identity on POSIX -- so no input distinguishes the two here and the
+    previous test asserted the substring 'fnmatchcase' appeared in the source,
+    which a comment satisfies. Poisoning the case-folding function proves which
+    one is actually called.
+    """
+    import fnmatch as fnmatch_mod
 
     from actions.subscriptions import Subscription
 
-    src = inspect.getsource(Subscription.matches)
-    assert "fnmatchcase" in src
+    def poisoned(*a, **k):
+        raise AssertionError("matches() used the case-folding matcher")
+
+    monkeypatch.setattr(fnmatch_mod, "fnmatch", poisoned)
+
+    sub = Subscription(
+        label="Cortex/Family/*", queue="school", events=frozenset({"added"})
+    )
+    assert sub.matches("Cortex/Family/School", "added") is True

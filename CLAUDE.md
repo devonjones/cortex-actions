@@ -80,8 +80,17 @@ From the parent `~/Projects/cortex/CLAUDE.md`:
 
 The routing decision is a pure function — `actions.subscriptions.targets()` —
 so the interesting behaviour needs no database. `tests/test_router.py` stubs the
-queue library and asserts the four outcomes that differ in cost: routed, dropped
-silently, dropped loudly, and claim handed back.
+queue library and asserts the **seven** outcomes in `router.OUTCOMES`, which
+differ in what they cost the event: `routed`, `unmatched` and `dropped` settle
+it; `failed` charges an attempt toward dead_letter; `released`, `lost` and
+`unsettled` hand it back uncharged.
+
+**A stub must match the function it replaces**, signature and defaults —
+`test_the_stubs_match_the_library` asserts that against `inspect.signature`,
+and `test_the_job_helper_matches_what_claim_actually_returns` reads `claim()`'s
+`RETURNING` clause. Ten router tests once passed against a job shape the queue
+library has never produced, while the service could not process a single real
+job; every fixture here is one edit away from being that again.
 
 `test_shipped_config_is_valid_and_routes_the_real_label` asserts that the YAML
 actually in `config/` parses and routes `Cortex/Family/School/DPS`. Keep it: a
