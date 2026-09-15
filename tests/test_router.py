@@ -1730,7 +1730,12 @@ def test_the_heals_ddl_is_given_a_lock_timeout(monkeypatch, spy):
     # the SET passed -- and an uncommitted session SET is rolled back with the
     # transaction, which is exactly the failure mode this line exists to stop.
     assert "commit" in conn.log[at : conn.log.index("DDL")]
-    assert any(line.startswith("exec:RESET ") for line in conn.log), conn.log
+    # Pinned exactly, like the SET above it: `startswith("exec:RESET ")` also
+    # matches `RESET ALL`, which would clear every session setting the
+    # connection carries rather than the one this code set. Fifth occurrence of
+    # this shape on this branch, and the first on the reset side -- the four
+    # before it were all fixed on the SET side of the same function.
+    assert "exec:RESET lock_timeout:None" in conn.log, conn.log
     assert calls["heal"] == [3]
 
 
@@ -2074,8 +2079,7 @@ def test_the_lock_timeout_is_reset_after_a_heal_that_failed(monkeypatch, spy):
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
 
-    resets = [line for line in conn.log if line.startswith("exec:RESET ")]
-    assert resets, conn.log
+    assert "exec:RESET lock_timeout:None" in conn.log, conn.log
     assert not conn.aborted
 
 
