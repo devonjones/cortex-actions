@@ -97,7 +97,11 @@ DEDUP_INDEX = (
 # unbounded: `_tx` issues SET LOCAL, which is transaction-scoped, and
 # `ensure_queue_table` and `_ensure_indexes` each open their own `_tx(conn)`
 # with no bound -- SCHEMA_LOCK_TIMEOUT_MS = 60s covers only the advisory-lock
-# front door, not the CREATE TABLE or the CREATE INDEX. (Checked in the
+# front door, not the CREATE TABLE or the CREATE INDEX. By omission rather than
+# by design: that function's own comment claims "every DDL statement below runs
+# under a 5s lock_timeout", which is not true of those two (cortex-yqke). If
+# the library ever closes that gap, boot is bounded again and this reasoning
+# needs re-checking rather than deleting. (Checked in the
 # library, after this comment first credited DDL_LOCK_TIMEOUT_MS, which does
 # not govern this value, and then SCHEMA_LOCK_TIMEOUT_MS, which does not govern
 # boot's DDL.) Measured: with a session-wide 2s, boot under contention raised
@@ -535,6 +539,14 @@ class Router:
         Called from the heal's handler, so a failure here must not replace the
         error being handled -- and when the connection is what failed, this
         fails too.
+
+        The swallow covers the SET as well as the RESET, which in principle
+        means a SET that failed on a live connection would run the DDL
+        unbounded and say nothing. No reachable trigger for that has been
+        found: every way to make the SET or its commit fail also kills the
+        connection, and the DDL then fails and is counted `partition_heal_
+        failed`. Recorded because "we looked and could not construct it" is a
+        better note than silence.
         """
         try:
             # ROLL BACK FIRST. A failed CREATE TABLE leaves the transaction
@@ -770,13 +782,18 @@ def main() -> None:
     signal.signal(signal.SIGINT, on_term)
     signal.signal(signal.SIGHUP, on_hup)
 
-    # 8098: the next free port in the fleet's block (8090-8097 are taken by
-    # postmark, triage and the gateway). The default was 8000, which is outside
-    # the range `~/HomeLab/monitoring/prometheus.yml` scrapes -- and nothing
-    # scrapes this service yet either way, so `CortexHighErrorRate` cannot fire
-    # for it and the routed/suppressed reading README says to take before
-    # flipping the producer is a hand curl. See cortex-cjzf.
-    start_metrics_server(port=int(os.environ.get("METRICS_PORT", "8098")))
+    # 8000, which is the fleet convention and was right all along. This is the
+    # port INSIDE the container: every cortex worker listens on 8000 or 8001
+    # and the 809x everyone quotes is the host side of a mapping in the stack
+    # file. It briefly defaulted to 8098 "the next free port in the block",
+    # which was wrong twice over -- wrong layer, and 8098 is published by
+    # cortex-teach on hades, so a stack file written from that comment would
+    # have failed to bind and the Prometheus job it told you to add would have
+    # scraped a different service and reported this router healthy.
+    #
+    # The published port is a deployment decision and belongs in the stack
+    # file, not here. Nothing scrapes this service yet: cortex-cjzf.
+    start_metrics_server(port=int(os.environ.get("METRICS_PORT", "8000")))
     router.run()
 
 

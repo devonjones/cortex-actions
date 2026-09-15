@@ -127,8 +127,8 @@ ninety seconds of Postgres being away would dead-letter every event in flight.
   otherwise become a pipeline-wide stall. A 2s `lock_timeout` is set around
   that DDL and reset afterwards. **Around the DDL only**: set on the
   connection, it also reached `ensure_queue_schema` at boot, where the library
-  leaves DDL unbounded on purpose, and a deploy against a busy queue became a
-  restart loop.
+  leaves DDL unbounded — by omission rather than by design (`cortex-yqke`) —
+  and a deploy against a busy queue became a restart loop.
 - **A CHECK violation naming a real constraint** — charged. Two different
   faults share SQLSTATE 23514, and the library's own predicate separates them
   on `exc.diag.constraint_name`.
@@ -149,11 +149,15 @@ walked at database round-trip speed.
 ## Nothing scrapes this service yet
 
 `~/HomeLab/monitoring/prometheus.yml` has no job for it, so none of the metrics
-above reach Prometheus, `CortexHighErrorRate` cannot fire for the router, and
+in **Metrics**, below, reach Prometheus, `CortexHighErrorRate` cannot fire for the router, and
 `CortexServiceDown` (`up{job=~"cortex-.*"}`) does not cover it. The
 `routed`/`suppressed` reading this document tells you to take before flipping
 `ACTIONS_QUEUE_ENABLED` is a hand `curl` until that lands — `cortex-cjzf`.
-`METRICS_PORT` defaults to 8098, the next free port in the fleet's block.
+
+`METRICS_PORT` is the port **inside** the container and defaults to 8000, the
+same as every other cortex worker. The published host port is a stack-file
+decision and is deliberately not named here; the hosts that would answer it
+change faster than this file does.
 
 ## Deployment order matters
 
@@ -170,7 +174,7 @@ and verify it drains before flipping that flag.**
 | `SUBSCRIPTIONS_PATH` | routing table | `/app/config/subscriptions.yaml` |
 | `BATCH_SIZE` | jobs claimed per pass | `50` |
 | `POLL_INTERVAL` | idle seconds between claims | `5` |
-| `METRICS_PORT` | Prometheus `/metrics` | `8098` |
+| `METRICS_PORT` | Prometheus `/metrics`, in-container | `8000` |
 | `LOG_LEVEL` | | `INFO` |
 
 ## Metrics

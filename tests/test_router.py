@@ -44,11 +44,12 @@ class FakeConn:
         self.closed = False
         # Postgres's rule, not a positional one: after a statement fails, every
         # later statement on the connection raises InFailedSqlTransaction until
-        # a rollback. Modelling it here is what makes the heal's own
-        # `conn.rollback()` load-bearing in the suite -- and an earlier version
-        # of this fake asserted "the last logged op was a rollback", which was
-        # both too strict (a SET may legitimately follow it) and too loose (an
-        # empty log passed).
+        # a rollback. Modelling it is what makes `_set_lock_timeout`'s rollback
+        # load-bearing in the suite -- deleting that line makes every heal fail
+        # with "current transaction is aborted", forever, which is what a real
+        # Postgres does. An earlier version asserted "the last logged op was a
+        # rollback", which was both too strict (a SET may legitimately follow
+        # it) and too loose (an empty log passed).
         self.aborted = False
 
     def commit(self) -> None:
@@ -73,16 +74,15 @@ class FakeConn:
                 return None
 
             def execute(self, sql: str, args: Any = None) -> None:
-                # Postgres's rule. This was removed once as unfalsifiable and
-                # is back because it stopped being so: a failed CREATE TABLE
-                # aborts the transaction, so the RESET in the heal's `finally`
-                # is refused unless something rolls back first -- and without
-                # that, a committed 2s lock_timeout leaks onto the connection
-                # for the rest of its life.
-                if conn.aborted:
-                    raise psycopg2.errors.InFailedSqlTransaction(
-                        "current transaction is aborted"
-                    )
+                # No aborted check. It has been added and removed three times
+                # on argument; this time it was settled by running the two
+                # mutations it could plausibly catch, with and without it:
+                # deleting `_set_lock_timeout`'s rollback, and moving that
+                # rollback after its own statement. Both die either way -- the
+                # first on FakePartitionManager's precondition, the second on
+                # this test's explicit ordering assertion. A check that catches
+                # nothing the suite does not already catch is the defect this
+                # branch is about, in a test double.
                 conn.log.append(f"exec:{sql}:{args}")
 
         return Cur()
@@ -193,7 +193,6 @@ def spy(monkeypatch):
                 # leaves it aborted for the caller.
                 self.conn.aborted = True
                 raise state["heal_raises"]
-            self.conn.log.append("commit")
             return state["heal_creates"]
 
     monkeypatch.setattr(R, "enqueue", fake_enqueue)
@@ -1319,7 +1318,7 @@ def test_main_installs_the_signal_handlers(monkeypatch):
 
     # Prometheus has to be able to scrape it, and the metrics are the whole
     # argument for flipping the producer on.
-    assert ports == [8098]
+    assert ports == [8000]
 
     router = captured[0]
     assert set(handlers) == {
@@ -1994,9 +1993,13 @@ def test_the_heal_releases_whatever_it_created(monkeypatch, spy, created):
 
 
 def test_a_settle_with_no_connection_drops_the_one_we_may_still_hold(monkeypatch, spy):
-    """`conn` is the local `_route` never received. `self._conn` can still be a
-    live object whose connect-time setup failed -- reusing it is how a router
-    talks to a connection it knows nothing good about."""
+    """`conn` is the local that `_route` never received, and `self._conn` must
+    not be left behind.
+
+    Belt and braces rather than a live defect: `_connect()` does no
+    post-connect work now, so `self._conn` here is already None or closed.
+    Asserted so the assumption is written down rather than remembered the next
+    time `_connect` grows a line."""
     _, _ = spy
     r = make_router(monkeypatch)
     r._conn = FakeConn()
@@ -2076,7 +2079,7 @@ def test_the_lock_timeout_is_reset_after_a_heal_that_failed(monkeypatch, spy):
     assert not conn.aborted
 
 
-def test_setting_the_lock_timeout_can_never_raise(monkeypatch, spy):
+def test_setting_the_lock_timeout_can_never_raise(monkeypatch):
     """It is called from a `finally` inside an exception handler.
 
     Anything escaping there escapes process_job, run() and main() -- and a
@@ -2087,16 +2090,11 @@ def test_setting_the_lock_timeout_can_never_raise(monkeypatch, spy):
     r = make_router(monkeypatch)
 
     class Hostile:
-        aborted = False
-        log: list = []
-
-        def cursor(self):
-            raise psycopg2.InterfaceError("connection already closed")
+        """Fails on the first thing touched. `rollback()` is now the first
+        statement of the try, so the rest is unreachable -- and that is the
+        point: whatever comes first, nothing escapes."""
 
         def rollback(self):
-            raise psycopg2.InterfaceError("connection already closed")
-
-        def commit(self):
             raise psycopg2.InterfaceError("connection already closed")
 
     r._set_lock_timeout(Hostile(), R.LOCK_TIMEOUT)
