@@ -177,3 +177,84 @@ def test_a_valid_file_still_loads(tmp_path):
         "subscriptions:\n  - label: 'Cortex/Family/School/*'\n    queue: school\n"
     )
     assert [s.queue for s in load(f)] == ["school"]
+
+
+def test_an_empty_table_is_refused():
+    """The silent outage this module exists to refuse.
+
+    Every event would take the `unmatched` path, which the router completes
+    cleanly and counts as success -- so a reload that deleted every rule logs
+    `reloaded subscriptions count=0` at INFO and the events are gone, with
+    nothing anywhere saying so.
+    """
+    with pytest.raises(SubscriptionError, match="empty"):
+        parse({"subscriptions": []})
+
+
+@pytest.mark.parametrize(
+    "entry,why",
+    [
+        ({"label": "Cortex/*", "queue": "s", "event": ["removed"]}, "events -> event"),
+        ({"label": "Cortex/*", "queue": "s", "queues": ["x"]}, "queue -> queues"),
+        (
+            {"label": "Cortex/*", "queue": "s", "priority": -100},
+            "a knob we do not read",
+        ),
+    ],
+)
+def test_a_key_we_do_not_know_is_a_typo(entry, why):
+    """`event:` for `events:` parses clean, defaults to ['added'], reloads
+    without complaint, and routes nothing that was meant to be routed."""
+    with pytest.raises(SubscriptionError, match="unknown key"):
+        parse({"subscriptions": [entry]})
+    assert why
+
+
+def test_the_keys_we_do_know_are_still_accepted():
+    """The direction that must still work."""
+    subs = parse(
+        {
+            "subscriptions": [
+                {"label": "Cortex/*", "queue": "s", "events": ["added", "removed"]}
+            ]
+        }
+    )
+    assert subs[0].events == frozenset({"added", "removed"})
+
+
+@pytest.mark.parametrize("entry", ["a string", ["a", "list"], 7, None])
+def test_an_entry_that_is_not_a_mapping_is_refused(entry):
+    """Without the guard this is an AttributeError, which escapes reload() and
+    kills the process on SIGHUP rather than being a refused reload."""
+    with pytest.raises(SubscriptionError, match="must be a mapping"):
+        parse({"subscriptions": [entry]})
+
+
+@pytest.mark.parametrize("label", ["", "   ", "\t"])
+def test_a_blank_label_is_refused(label):
+    """fnmatch('anything', '') is False, so a blank label is a rule that can
+    never fire -- configured, and silent."""
+    with pytest.raises(SubscriptionError, match="'label' must be"):
+        parse({"subscriptions": [{"label": label, "queue": "s"}]})
+
+
+@pytest.mark.parametrize("queue", ["", "   "])
+def test_a_blank_queue_is_refused(queue):
+    """An empty queue_name inserts rows nothing ever claims."""
+    with pytest.raises(SubscriptionError, match="'queue' must be|whitespace"):
+        parse({"subscriptions": [{"label": "Cortex/*", "queue": queue}]})
+
+
+def test_matching_uses_the_case_sensitive_matcher_by_construction():
+    """`fnmatch` lowercases through os.path.normcase -- which is the identity
+    on POSIX, so on this host no input can tell the two apart. The behaviour
+    is real on a case-insensitive filesystem and the difference matters
+    (`Cortex/Family` and `cortex/family` are different Gmail labels), so assert
+    the choice structurally rather than shipping a test that cannot fail.
+    """
+    import inspect
+
+    from actions.subscriptions import Subscription
+
+    src = inspect.getsource(Subscription.matches)
+    assert "fnmatchcase" in src

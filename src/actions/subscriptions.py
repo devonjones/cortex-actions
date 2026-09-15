@@ -25,6 +25,9 @@ SOURCE_QUEUE = "actions"
 
 VALID_EVENTS = frozenset({"added", "removed"})
 
+# Every key an entry may carry. Anything else is refused -- see parse().
+_KEYS = frozenset({"label", "queue", "events"})
+
 
 class SubscriptionError(ValueError):
     """The routing table is malformed. Always fatal -- see load()."""
@@ -64,6 +67,17 @@ def parse(raw: Any) -> list[Subscription]:
         raise SubscriptionError("missing 'subscriptions' key")
     if not isinstance(entries, list):
         raise SubscriptionError("'subscriptions' must be a list")
+    if not entries:
+        # An EMPTY table is the silent outage this module exists to refuse.
+        # Every event then takes the `unmatched` path, which the router
+        # completes cleanly and counts as success -- so a reload that deleted
+        # every rule logs "reloaded subscriptions count=0" at INFO and the
+        # events are gone, permanently, with nothing anywhere saying so. A
+        # router with no rules has no reason to be running; say so at boot, and
+        # on SIGHUP keep the table that works.
+        raise SubscriptionError(
+            "'subscriptions' is empty; a router with no rules routes nothing"
+        )
 
     subs: list[Subscription] = []
     seen: set[tuple[str, str]] = set()
@@ -72,6 +86,17 @@ def parse(raw: Any) -> list[Subscription]:
         where = f"subscriptions[{i}]"
         if not isinstance(entry, dict):
             raise SubscriptionError(f"{where}: must be a mapping")
+
+        # A KEY WE DO NOT KNOW IS A TYPO, and a typo here is silence. `event:`
+        # for `events:` parses clean, defaults to ["added"], reloads without
+        # complaint and routes nothing that was meant to be routed. There is no
+        # forward-compatibility cost to refusing: this file ships in the image
+        # next to the code that reads it.
+        unknown = sorted(set(entry) - _KEYS)
+        if unknown:
+            raise SubscriptionError(
+                f"{where}: unknown key(s) {unknown}; valid: {sorted(_KEYS)}"
+            )
 
         label = entry.get("label")
         if not isinstance(label, str) or not label.strip():
