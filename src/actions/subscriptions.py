@@ -25,6 +25,9 @@ SOURCE_QUEUE = "actions"
 
 VALID_EVENTS = frozenset({"added", "removed"})
 
+# Every key an entry may carry. Anything else is refused -- see parse().
+_KEYS = frozenset({"label", "queue", "events"})
+
 
 class SubscriptionError(ValueError):
     """The routing table is malformed. Always fatal -- see load()."""
@@ -64,6 +67,17 @@ def parse(raw: Any) -> list[Subscription]:
         raise SubscriptionError("missing 'subscriptions' key")
     if not isinstance(entries, list):
         raise SubscriptionError("'subscriptions' must be a list")
+    if not entries:
+        # An EMPTY table is the silent outage this module exists to refuse.
+        # Every event then takes the `unmatched` path, which the router
+        # completes cleanly and counts as success -- so a reload that deleted
+        # every rule logs "reloaded subscriptions count=0" at INFO and the
+        # events are gone, permanently, with nothing anywhere saying so. A
+        # router with no rules has no reason to be running; say so at boot, and
+        # on SIGHUP keep the table that works.
+        raise SubscriptionError(
+            "'subscriptions' is empty; a router with no rules routes nothing"
+        )
 
     subs: list[Subscription] = []
     seen: set[tuple[str, str]] = set()
@@ -72,6 +86,17 @@ def parse(raw: Any) -> list[Subscription]:
         where = f"subscriptions[{i}]"
         if not isinstance(entry, dict):
             raise SubscriptionError(f"{where}: must be a mapping")
+
+        # A KEY WE DO NOT KNOW IS A TYPO, and a typo here is silence. `event:`
+        # for `events:` parses clean, defaults to ["added"], reloads without
+        # complaint and routes nothing that was meant to be routed. There is no
+        # forward-compatibility cost to refusing: this file ships in the image
+        # next to the code that reads it.
+        unknown = sorted(set(entry) - _KEYS)
+        if unknown:
+            raise SubscriptionError(
+                f"{where}: unknown key(s) {unknown}; valid: {sorted(_KEYS)}"
+            )
 
         label = entry.get("label")
         if not isinstance(label, str) or not label.strip():
@@ -93,7 +118,10 @@ def parse(raw: Any) -> list[Subscription]:
         raw_events = entry.get("events", ["added"])
         if not isinstance(raw_events, list) or not raw_events:
             raise SubscriptionError(f"{where}: 'events' must be a non-empty list")
-        bad = [e for e in raw_events if e not in VALID_EVENTS]
+        # isinstance first: `["added"] in frozenset(...)` is a TypeError, not
+        # False, so a nested list in the YAML would escape as an unhandled
+        # TypeError instead of the SubscriptionError the caller handles.
+        bad = [e for e in raw_events if not isinstance(e, str) or e not in VALID_EVENTS]
         if bad:
             raise SubscriptionError(
                 f"{where}: unknown event(s) {bad}; valid: {sorted(VALID_EVENTS)}"
@@ -125,6 +153,15 @@ def load(path: str | Path) -> list[Subscription]:
         raw = yaml.safe_load(p.read_text())
     except FileNotFoundError as e:
         raise SubscriptionError(f"no subscriptions file at {p}") from e
+    except (OSError, UnicodeDecodeError) as e:
+        # Every way a file can refuse to be read, not just the missing one:
+        # a bind mount landing as a directory (IsADirectoryError), a mode the
+        # container user cannot read (PermissionError), a half-written file
+        # (UnicodeDecodeError). On SIGHUP the router catches SubscriptionError
+        # and keeps the table it has; anything else escapes reload() and exits
+        # the process -- so a bad `docker cp` would take the router down rather
+        # than be refused.
+        raise SubscriptionError(f"cannot read {p}: {e}") from e
     except yaml.YAMLError as e:
         raise SubscriptionError(f"{p} is not valid YAML: {e}") from e
     return parse(raw)
