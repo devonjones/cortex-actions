@@ -97,8 +97,11 @@ that had already finished would get the work twice.
 If the claim is lost to the visibility timeout mid-job, the enqueues are rolled
 back; whoever holds the claim now will redo them.
 
-The downstream job keeps the priority the source event carried, so a backfill
-enqueued at `-100` stays behind real-time mail all the way through.
+The downstream job keeps the priority the source event carried, so a `-100`
+backfill row stays behind real-time mail on its way through **this service**.
+The pipeline does not deliver that yet: the only producer for the `actions`
+queue inserts without a priority column, so every event arrives at the table
+default of 0 (`cortex-0oya`). This end is ready for the fix at the other end.
 
 ## Failure, and what it costs the event
 
@@ -181,8 +184,17 @@ and verify it drains before flipping that flag.**
     infrastructure failure, lost to another worker, or left to the visibility
     timeout. No attempt charged, so the same job comes back.
 - `cortex_errors_total{service="actions-router",error_type}` — `never_started`,
-  `job_failed`, `claim_lost`, `malformed_event`, `settle_error`,
-  `partition_heal_failed`, `bad_subscriptions`, `claim_error`.
+  `no_connection`, `job_failed`, `claim_lost`, `malformed_event`,
+  `settle_error`, `partition_heal_failed`, `bad_subscriptions`, `claim_error`.
+
+  `never_started` and `no_connection` are both outages and are deliberately
+  separate: a `never_started` job is back in a poll interval, a
+  `no_connection` one sits in `processing` until the five-minute visibility
+  timeout. `partition_heal_failed` counts *heal attempts*, which are rate
+  limited to one per poll interval, not affected events — so it under-reports
+  by design, and at a `POLL_INTERVAL` above 10s it falls below the fleet's
+  `rate(cortex_errors_total[5m]) > 0.1` alert threshold on its own. The events
+  it describes still page through `never_started`, which is proportional.
 
 The seven-way detail behind those three statuses is in the per-batch INFO log
 line, not in a metric: `batch claimed=50 routed=3 unmatched=47`.

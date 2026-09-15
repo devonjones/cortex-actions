@@ -41,8 +41,8 @@ from cortex_utils.queue import (
     release,
     worker_identity,
 )
+from cortex_utils.queue.ops import PARTITION_LOCK_TIMEOUT_MS, is_dedup_value
 from cortex_utils.queue.ops import _is_missing_partition as is_missing_partition
-from cortex_utils.queue.ops import is_dedup_value
 from prometheus_client import Counter
 
 from actions.subscriptions import (
@@ -85,10 +85,21 @@ DEDUP_INDEX = (
     "WHERE status IN ('pending', 'processing')",
 )
 
-# Matches cortex_utils.queue's own DDL_LOCK_TIMEOUT_MS. Long enough for an
-# uncontended lock, short enough that a stalled router does not stall the
-# pipeline behind it.
-LOCK_TIMEOUT = "2s"
+# The library's own number for partition DDL, taken from the library rather
+# than copied: long enough for an uncontended lock, short enough that a stalled
+# router does not stall the pipeline behind it. (An earlier comment here
+# credited `DDL_LOCK_TIMEOUT_MS`, which is 5000 and belongs to dead-lettering.
+# Naming a constant that does not govern the value is how someone later
+# "restores the match" by changing the value.)
+#
+# Deliberately NOT set on the connection: a session-wide lock_timeout would
+# also govern `ensure_queue_schema` at boot, where the library allows
+# SCHEMA_LOCK_TIMEOUT_MS = 60s precisely because CREATE INDEX and the first
+# partition wait behind ordinary writers. Measured: boot under contention
+# raised LockNotAvailable at 2.02s and propagated out of main(), turning a
+# deploy against a busy queue into a restart loop. Boot should wait; the heal
+# should not.
+LOCK_TIMEOUT = f"{PARTITION_LOCK_TIMEOUT_MS}ms"
 
 # Outcomes that mean this batch actually moved work. Anything else hands the
 # job back uncharged, so the same rows can come straight back -- see run().
@@ -150,7 +161,9 @@ def _label_prefix(label: str) -> str:
 
 
 # Failures that mean the work NEVER STARTED, so the event is released rather
-# than charged an attempt. Everything else is a fault in the event itself.
+# than charged an attempt. NOT the whole of that category any more: a
+# CheckViolation naming no constraint is a missing partition, handled ahead of
+# this tuple, and it releases too. What is left over is a fault in the event.
 #
 # This is the distinction cortex-school spent five review rounds and four P0s
 # getting right, in both directions. The primitive's own docstring names the
@@ -207,16 +220,6 @@ class Router:
     def _connect(self) -> Any:
         if self._conn is None or self._conn.closed:
             self._conn = psycopg2.connect(self.dsn)
-            with self._conn.cursor() as cur:
-                # Never wait indefinitely for a lock on the shared `queue`
-                # table. The partition heal runs DDL, which takes an
-                # AccessExclusiveLock on the parent, and Postgres's lock queue
-                # is FIFO -- an ungranted AccessExclusive stalls every reader
-                # behind it, conflicting or not. The library sets exactly this
-                # on its own write-path heal (DDL_LOCK_TIMEOUT_MS); a router
-                # doing DDL on an error path needs it more, not less.
-                cur.execute("SET lock_timeout = %s", (LOCK_TIMEOUT,))
-            self._conn.commit()
         return self._conn
 
     def _ensure_schema(self) -> None:
@@ -303,8 +306,13 @@ class Router:
             logger.error(
                 "dropping malformed action event", job_id=job.get("id"), payload=raw
             )
-            ERRORS.labels(service=SERVICE, error_type="malformed_event").inc()
-            return self._complete(conn, job, "dropped")
+            outcome = self._complete(conn, job, "dropped")
+            if outcome == "dropped":
+                # Same reason, and it matters more here: a dropped event counts
+                # `success` in QUEUE_PROCESSED, so this counter is the only
+                # metric that distinguishes a discarded event from a routed one.
+                ERRORS.labels(service=SERVICE, error_type="malformed_event").inc()
+            return outcome
 
         # CLAUDE.md: 0 for real-time mail, -100 for backfill, "so backfill
         # doesn't block real-time mail processing". Dropping it here would
@@ -323,9 +331,15 @@ class Router:
             # THE COMMON CASE, and deliberately not a failure. Most Cortex/*
             # traffic has no subscriber; failing here would fill dead_letter
             # with healthy events and bury the real ones.
-            UNMATCHED.labels(label_prefix=prefix).inc()
             logger.debug("no subscription", label=label, event_type=event_type)
-            return self._complete(conn, job, "unmatched")
+            outcome = self._complete(conn, job, "unmatched")
+            if outcome == "unmatched":
+                # After the settle, like ROUTED and SUPPRESSED. This branch
+                # runs for the overwhelming majority of events, so it is the
+                # one whose shape gets copied -- and a lost claim counted the
+                # event here and again on the retry.
+                UNMATCHED.labels(label_prefix=prefix).inc()
+            return outcome
 
         enqueued: list[tuple[str, bool]] = []
         for queue_name in queues:
@@ -407,7 +421,10 @@ class Router:
             # predicate -- `enqueue()` itself gates its self-heal on it -- and
             # it keys on `exc.diag.constraint_name` rather than message text,
             # which is locale-dependent and reworded between Postgres versions.
-            # `queue_valid_status` is a real named CHECK on the deployed schema.
+            # `queue_new_valid_status` is the real named CHECK on the
+            # deployed schema -- read off hades rather than guessed. An earlier
+            # comment here called it `queue_valid_status`, which exists nowhere,
+            # and that name was then copied into a test and a ticket.
             if not is_missing_partition(e):
                 return self._settle(conn, job, e, kind="failed")
             return self._heal_partition_then_settle(conn, job, e)
@@ -464,7 +481,22 @@ class Router:
                 # partition calls use bare cursors -- without this they raise
                 # InFailedSqlTransaction and every heal "fails".
                 conn.rollback()
+                # A committed session SET, not SET LOCAL: `create_partition`
+                # runs its own transactions with bare cursors and sets no
+                # timeout of its own, so SET LOCAL would expire before the DDL
+                # it is meant to bound. Committing is what makes it survive
+                # into them -- measured, a blocked CREATE TABLE ... PARTITION OF
+                # then raises LockNotAvailable at 2.00s instead of queueing
+                # ahead of every reader of `queue`.
+                self._set_lock_timeout(conn, LOCK_TIMEOUT)
                 created = PartitionManager(conn).create_future_partitions(days_ahead=3)
+                # `created` is logged, not branched on, and that is the
+                # invariant: on a violation naming no constraint, zero created
+                # means another worker won the race, so releasing is still
+                # right. It would stop being right if a row could carry a
+                # `created_at` outside the window this heal covers. Nothing
+                # sets one today -- the column is NOW() on the server -- and if
+                # anything ever does, this is the line that has to change.
                 logger.warning(
                     "created missing queue partitions",
                     job_id=job.get("id"),
@@ -478,7 +510,27 @@ class Router:
                     error=str(exc)[:300],
                     heal_error=str(heal_exc)[:300],
                 )
+            finally:
+                self._set_lock_timeout(conn, None)
         return self._settle(conn, job, exc, kind="released")
+
+    @staticmethod
+    def _set_lock_timeout(conn: Any, value: str | None) -> None:
+        """Set or reset the session lock_timeout. Never raises.
+
+        Called from the heal's handler, so a failure here must not replace the
+        error being handled -- and when the connection is what failed, this
+        fails too.
+        """
+        try:
+            with conn.cursor() as cur:
+                if value is None:
+                    cur.execute("RESET lock_timeout")
+                else:
+                    cur.execute("SET lock_timeout = %s", (value,))
+            conn.commit()
+        except Exception:  # noqa: BLE001 - see the docstring
+            pass
 
     def _settle(
         self, conn: Any, job: dict[str, Any], exc: Exception, *, kind: str
@@ -498,13 +550,25 @@ class Router:
         """
         job_id = job.get("id")
         if conn is None:
-            # We never got a connection, so there is nothing to say it on.
-            ERRORS.labels(service=SERVICE, error_type="never_started").inc()
+            # Its OWN error_type, not `never_started`, for two reasons. The
+            # recovery profiles differ sixty-fold -- a released job is back in
+            # `poll_interval` seconds, this one sits in `processing` until the
+            # five-minute visibility timeout -- and `never_started` is the
+            # Postgres-outage series, so an on-call following the alert
+            # annotation would be sent to a healthy database. The old hardcoded
+            # value also lied for `kind="failed"`: a fault in the event that we
+            # could not record is not an outage.
+            ERRORS.labels(service=SERVICE, error_type="no_connection").inc()
             logger.error(
                 "no connection to settle on; leaving it to the visibility timeout",
                 job_id=job_id,
+                kind=kind,
                 error=str(exc)[:300],
             )
+            # `conn` is the local `_route` never received; `self._conn` may
+            # still hold a live object whose connect-time setup failed. Drop it
+            # rather than reuse a connection we know nothing good about.
+            self._drop_conn()
             return self._counted("unsettled")
         try:
             conn.rollback()

@@ -42,12 +42,21 @@ class FakeConn:
         self.log: list[str] = []
         self.closes = 0
         self.closed = False
+        # Postgres's rule, not a positional one: after a statement fails, every
+        # later statement on the connection raises InFailedSqlTransaction until
+        # a rollback. Modelling it here is what makes the heal's own
+        # `conn.rollback()` load-bearing in the suite -- and an earlier version
+        # of this fake asserted "the last logged op was a rollback", which was
+        # both too strict (a SET may legitimately follow it) and too loose (an
+        # empty log passed).
+        self.aborted = False
 
     def commit(self) -> None:
         self.log.append("commit")
 
     def rollback(self) -> None:
         self.log.append("rollback")
+        self.aborted = False
 
     def close(self) -> None:
         self.closes += 1
@@ -64,6 +73,11 @@ class FakeConn:
                 return None
 
             def execute(self, sql: str, args: Any = None) -> None:
+                # No aborted-transaction check here on purpose: deleting one
+                # was invisible to the suite, and an unfalsifiable guard is the
+                # defect this whole branch is about. The precondition is
+                # modelled where it bites, in FakePartitionManager, and the
+                # ordering is asserted directly in the lock-timeout test.
                 conn.log.append(f"exec:{sql}:{args}")
 
         return Cur()
@@ -147,15 +161,19 @@ def spy(monkeypatch):
         heal 'fails' -- which is why this fake refuses to work if the rollback
         did not happen. A fake with no preconditions made that rollback
         deletable with the suite green.
+
+        The lock-timeout test now asserts that ordering explicitly too, so
+        deleting this check alone is invisible. Kept deliberately: it is what
+        makes any FUTURE heal test enforce the precondition without having to
+        remember it. Modelling a real constraint in a double is not the same
+        thing as a production guard that cannot fire.
         """
 
         def __init__(self, conn):
             self.conn = conn
 
         def create_future_partitions(self, days_ahead=3, dry_run=False, days_back=0):
-            # Unconditional: an empty log means no rollback happened either,
-            # and `if self.conn.log and ...` let exactly that through.
-            if not self.conn.log or self.conn.log[-1] != "rollback":
+            if self.conn.aborted:
                 raise psycopg2.errors.InFailedSqlTransaction(
                     "current transaction is aborted"
                 )
@@ -170,6 +188,17 @@ def spy(monkeypatch):
     monkeypatch.setattr(R, "release", fake_release)
     monkeypatch.setattr(R, "PartitionManager", FakePartitionManager)
     return calls, state
+
+
+def raising_enqueue(exc):
+    """An enqueue that fails the way a real one does: the statement aborts the
+    transaction, so everything after it raises until someone rolls back."""
+
+    def _raise(conn, *a, **k):
+        conn.aborted = True
+        raise exc
+
+    return _raise
 
 
 def make_router(monkeypatch, subs=SUBS) -> R.Router:
@@ -302,9 +331,7 @@ def test_unexpected_error_charges_an_attempt(monkeypatch, spy):
     r = make_router(monkeypatch)
     conn = FakeConn()
     monkeypatch.setattr(r, "_connect", lambda: conn)
-    monkeypatch.setattr(
-        R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
+    monkeypatch.setattr(R, "enqueue", raising_enqueue(RuntimeError("boom")))
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "failed"
     assert calls["fail"] and "boom" in calls["fail"][0][1]
@@ -401,7 +428,7 @@ def test_infrastructure_failure_releases_and_charges_nothing(monkeypatch, spy, e
     r = make_router(monkeypatch)
     conn = FakeConn()
     monkeypatch.setattr(r, "_connect", lambda: conn)
-    monkeypatch.setattr(R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(R, "enqueue", raising_enqueue(exc))
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
     assert calls["release"] == [(1, r.poll_interval)]
@@ -415,9 +442,7 @@ def test_a_fault_in_the_event_still_charges_an_attempt(monkeypatch, spy):
     r = make_router(monkeypatch)
     conn = FakeConn()
     monkeypatch.setattr(r, "_connect", lambda: conn)
-    monkeypatch.setattr(
-        R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(TypeError("bad payload"))
-    )
+    monkeypatch.setattr(R, "enqueue", raising_enqueue(TypeError("bad payload")))
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "failed"
     assert calls["fail"] and "bad payload" in calls["fail"][0][1]
@@ -446,7 +471,7 @@ def test_a_settle_that_fails_does_not_kill_the_loop(monkeypatch, spy):
     monkeypatch.setattr(
         R,
         "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(psycopg2.OperationalError("gone")),
+        raising_enqueue(psycopg2.OperationalError("gone")),
     )
     before = {
         s: counter("cortex_queue_processed", queue=R.SOURCE_QUEUE, status=s)
@@ -683,12 +708,22 @@ def test_the_stubs_match_the_library(spy):
         ("release", Q.release),
         ("claim", Q.claim),
         ("ensure_queue_schema", Q.ensure_queue_schema),
+        ("PartitionManager", Q.PartitionManager),
     ]:
         stub = getattr(R, name)
         if stub is real:
             continue  # not stubbed in this test's fixture
-        ours = list(inspect.signature(stub).parameters.values())
-        theirs = list(inspect.signature(real).parameters.values())
+        if isinstance(real, type):
+            # A class stub: compare the method the router actually calls.
+            ours = list(
+                inspect.signature(stub.create_future_partitions).parameters.values()
+            )[1:]
+            theirs = list(
+                inspect.signature(real.create_future_partitions).parameters.values()
+            )[1:]
+        else:
+            ours = list(inspect.signature(stub).parameters.values())
+            theirs = list(inspect.signature(real).parameters.values())
         assert [p.name for p in ours] == [p.name for p in theirs], name
         # AND the defaults. `commit=True` in the library with `commit=False` in
         # the fake means the atomicity assertion rests on a default nothing
@@ -853,7 +888,7 @@ def test_a_lost_claim_while_settling_is_reported_as_lost(monkeypatch, spy):
     monkeypatch.setattr(
         R,
         "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(psycopg2.OperationalError("gone")),
+        raising_enqueue(psycopg2.OperationalError("gone")),
     )
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "lost"
@@ -865,9 +900,7 @@ def test_a_stale_fail_report_is_reported_as_lost(monkeypatch, spy):
     r = make_router(monkeypatch)
     conn = FakeConn()
     monkeypatch.setattr(r, "_connect", lambda: conn)
-    monkeypatch.setattr(
-        R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
+    monkeypatch.setattr(R, "enqueue", raising_enqueue(RuntimeError("boom")))
     before = counter("cortex_errors", service=R.SERVICE, error_type="job_failed")
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "lost"
@@ -1065,7 +1098,7 @@ def test_a_batch_that_settles_nothing_backs_off(monkeypatch, spy):
     monkeypatch.setattr(
         R,
         "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(psycopg2.OperationalError("gone")),
+        raising_enqueue(psycopg2.OperationalError("gone")),
     )
     slept: list[int] = []
     monkeypatch.setattr(r, "_sleep", lambda: slept.append(1))
@@ -1312,7 +1345,7 @@ def produce(r, outcome, monkeypatch, spy):
     monkeypatch.setattr(r, "_connect", lambda: conn)
 
     def boom(exc):
-        monkeypatch.setattr(R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(exc))
+        monkeypatch.setattr(R, "enqueue", raising_enqueue(exc))
 
     if outcome == "routed":
         return r.process_job(event("Cortex/Family/School/DPS"))
@@ -1550,9 +1583,7 @@ def test_every_progress_member_disarms_the_backoff(monkeypatch, spy, member):
         "failed": event("Cortex/Family/School/DPS"),
     }
     if member == "failed":
-        monkeypatch.setattr(
-            R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-        )
+        monkeypatch.setattr(R, "enqueue", raising_enqueue(RuntimeError("boom")))
 
     drive(monkeypatch, r, [[outcomes[member]], []], conn=conn)
 
@@ -1571,9 +1602,11 @@ def test_no_outcome_that_hands_the_job_back_counts_as_progress(member):
 
 
 def test_a_named_constraint_violation_is_a_fault_not_an_outage(monkeypatch, spy):
-    """Two faults share SQLSTATE 23514. `queue_valid_status` is a real named
-    CHECK on the deployed schema; treating it as a missing partition released
-    it forever, uncharged and never dead-lettered."""
+    """Two faults share SQLSTATE 23514. `queue_new_valid_status` is the real
+    named CHECK on the deployed schema (read off hades -- an earlier comment
+    called it `queue_valid_status`, which exists nowhere, and the wrong name
+    was copied from there into this test and into a ticket). Treating it as a
+    missing partition released it forever, uncharged, never dead-lettered."""
     calls, _ = spy
     r = make_router(monkeypatch)
     conn = FakeConn()
@@ -1583,10 +1616,10 @@ def test_a_named_constraint_violation_is_a_fault_not_an_outage(monkeypatch, spy)
     monkeypatch.setattr(
         type(exc),
         "diag",
-        property(lambda self: _Diag("queue_valid_status")),
+        property(lambda self: _Diag("queue_new_valid_status")),
         raising=False,
     )
-    monkeypatch.setattr(R, "enqueue", lambda *a, **k: (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(R, "enqueue", raising_enqueue(exc))
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "failed"
     assert calls["heal"] == []
@@ -1663,18 +1696,71 @@ def test_a_heal_that_creates_nothing_still_releases(monkeypatch, spy):
     assert calls["fail"] == []
 
 
-def test_the_connection_is_given_a_lock_timeout(monkeypatch):
+def test_the_heals_ddl_is_given_a_lock_timeout(monkeypatch, spy):
     """An ungranted AccessExclusiveLock stalls every reader queued behind it,
-    conflicting or not. The library sets the same on its own write-path heal."""
+    conflicting or not, because Postgres's lock queue is FIFO.
+
+    It must be SET (committed), not SET LOCAL: `create_partition` runs its own
+    transactions with bare cursors and sets no timeout of its own, so a LOCAL
+    one would expire before the DDL it is meant to bound.
+    """
+    calls, _ = spy
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
+    )
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+
+    # `"SET lock_timeout" in line` also matches RE + SET lock_timeout, so the
+    # RESET satisfied the assertion for the SET and deleting the SET passed.
+    sets = [i for i, line in enumerate(conn.log) if line.startswith("exec:SET ")]
+    assert sets, conn.log
+    assert R.LOCK_TIMEOUT in conn.log[sets[0]]
+    # after the rollback that clears the aborted transaction, and committed so
+    # the library's own transactions inherit it
+    assert "rollback" in conn.log[: sets[0]]
+    assert "commit" in conn.log[sets[0] :]
+    assert any(line.startswith("exec:RESET ") for line in conn.log), conn.log
+    assert calls["heal"] == [3]
+
+
+def test_the_lock_timeout_is_the_librarys_own_number():
+    """Pinned as a literal, not read back from the constant it checks -- that
+    shape passed with `LOCK_TIMEOUT = "0"`, which Postgres reads as *no*
+    timeout. Derived from PARTITION_LOCK_TIMEOUT_MS so it cannot drift from the
+    value the library uses for the same DDL.
+    """
+    from cortex_utils.queue.ops import PARTITION_LOCK_TIMEOUT_MS
+
+    assert R.LOCK_TIMEOUT == "2000ms"
+    assert f"{PARTITION_LOCK_TIMEOUT_MS}ms" == R.LOCK_TIMEOUT
+    assert PARTITION_LOCK_TIMEOUT_MS > 0
+
+
+def test_boot_is_not_given_the_heals_lock_timeout(monkeypatch):
+    """A session-wide lock_timeout would also govern `ensure_queue_schema`,
+    where the library allows SCHEMA_LOCK_TIMEOUT_MS = 60s precisely because
+    CREATE INDEX and the first partition wait behind ordinary writers.
+    Measured: boot under contention raised LockNotAvailable at 2.02s and
+    propagated out of main(), turning a deploy against a busy queue into a
+    restart loop. Boot should wait; the heal should not.
+    """
+    from cortex_utils.queue.schema import SCHEMA_LOCK_TIMEOUT_MS
+
     r = make_router(monkeypatch)
     conn = FakeConn()
     monkeypatch.setattr(R.psycopg2, "connect", lambda dsn: conn)
 
     r._connect()
 
-    assert any(
-        "SET lock_timeout" in line and R.LOCK_TIMEOUT in line for line in conn.log
-    ), conn.log
+    assert not any("lock_timeout" in line for line in conn.log), conn.log
+    assert conn.log == []
+    assert int(R.LOCK_TIMEOUT.removesuffix("ms")) < SCHEMA_LOCK_TIMEOUT_MS
 
 
 def test_a_row_with_no_payload_at_all_is_dropped(monkeypatch, spy):
@@ -1694,3 +1780,253 @@ def test_a_row_with_no_payload_at_all_is_dropped(monkeypatch, spy):
 
     assert r._route(FakeConn(), row) == "dropped"
     assert calls["fail"] == []
+
+
+# -- every error has a name, and it is asserted ----------------------------
+
+
+def drive_error(kind, r, monkeypatch, spy):
+    """Drive exactly one ERRORS path. Returns nothing; asserts are the caller's."""
+    calls, state = spy
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+
+    if kind == "job_failed":
+        monkeypatch.setattr(R, "enqueue", raising_enqueue(RuntimeError("boom")))
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "failed"
+    elif kind == "never_started":
+        monkeypatch.setattr(
+            R, "enqueue", raising_enqueue(psycopg2.OperationalError("gone"))
+        )
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+    elif kind == "no_connection":
+        monkeypatch.setattr(
+            r,
+            "_connect",
+            lambda: (_ for _ in ()).throw(psycopg2.OperationalError("no server")),
+        )
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "unsettled"
+    elif kind == "claim_lost_completing":
+        state["complete_returns"] = False
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "lost"
+    elif kind == "claim_lost_settling":
+        state["release_returns"] = False
+        monkeypatch.setattr(
+            R, "enqueue", raising_enqueue(psycopg2.OperationalError("gone"))
+        )
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "lost"
+    elif kind == "settle_error":
+        monkeypatch.setattr(
+            R, "enqueue", raising_enqueue(psycopg2.OperationalError("gone"))
+        )
+        monkeypatch.setattr(
+            conn, "rollback", lambda: (_ for _ in ()).throw(psycopg2.InterfaceError())
+        )
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "unsettled"
+    elif kind == "malformed_event":
+        assert r.process_job(job({"gmail_id": "abc"})) == "dropped"
+    elif kind == "partition_heal_failed":
+        state["heal_raises"] = RuntimeError("no permission")
+        monkeypatch.setattr(
+            R,
+            "enqueue",
+            raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
+        )
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+    elif kind == "claim_error":
+        monkeypatch.setattr(R, "ensure_queue_schema", lambda c, extra_indexes=(): None)
+        monkeypatch.setattr(r, "_sleep", lambda: r._stop.set())
+        monkeypatch.setattr(
+            R,
+            "claim",
+            lambda *a, **k: (_ for _ in ()).throw(psycopg2.OperationalError("gone")),
+        )
+        r.run()
+    elif kind == "bad_subscriptions":
+        monkeypatch.setattr(
+            R, "load", lambda path: (_ for _ in ()).throw(R.SubscriptionError("bad"))
+        )
+        r.reload()
+    else:
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize(
+    "kind,error_type",
+    [
+        ("job_failed", "job_failed"),
+        ("never_started", "never_started"),
+        ("no_connection", "no_connection"),
+        ("claim_lost_completing", "claim_lost"),
+        ("claim_lost_settling", "claim_lost"),
+        ("settle_error", "settle_error"),
+        ("malformed_event", "malformed_event"),
+        ("partition_heal_failed", "partition_heal_failed"),
+        ("claim_error", "claim_error"),
+        ("bad_subscriptions", "bad_subscriptions"),
+    ],
+)
+def test_every_failure_increments_its_own_error_type(
+    monkeypatch, spy, kind, error_type
+):
+    """Six of eight ERRORS increments were deletable with the suite green, and
+    the `service` label was free -- `service="triage"` passed.
+
+    Two of these paths have no other metric at all: `claim_error` (the dead-DB
+    loop) and `malformed_event`, where the drop is irreversible and counts as
+    `success` in QUEUE_PROCESSED.
+    """
+    r = make_router(monkeypatch)
+    before = counter("cortex_errors", service=R.SERVICE, error_type=error_type)
+    wrong_service = counter("cortex_errors", service="triage", error_type=error_type)
+
+    drive_error(kind, r, monkeypatch, spy)
+
+    assert (
+        counter("cortex_errors", service=R.SERVICE, error_type=error_type) == before + 1
+    )
+    assert counter("cortex_errors", service="triage", error_type=error_type) == (
+        wrong_service
+    )
+
+
+def test_a_claim_lost_while_settling_is_still_counted_once(monkeypatch, spy):
+    """`produce()` reaches `lost` only through `_complete`, so the settle-side
+    `lost` return was the one settle path whose `_counted` was deletable."""
+    _, state = spy
+    state["release_returns"] = False
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R, "enqueue", raising_enqueue(psycopg2.OperationalError("gone"))
+    )
+    before = counter("cortex_queue_processed", queue=R.SOURCE_QUEUE, status="skipped")
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "lost"
+
+    assert counter(
+        "cortex_queue_processed", queue=R.SOURCE_QUEUE, status="skipped"
+    ) == (before + 1)
+
+
+# -- the rate limit, in both directions ------------------------------------
+
+
+def test_a_failing_heal_is_rate_limited_too(monkeypatch, spy):
+    """THE BRANCH AN OUTAGE ACTUALLY TAKES.
+
+    The upper-bound test drives a heal that SUCCEEDS; moving
+    `self._last_heal = ...` inside the try -- so only a successful heal spends
+    the token -- passes that one, and measured 1280 heals against 8 on a real
+    database. The failing heal is the case the rate limit exists for.
+    """
+    calls, state = spy
+    state["heal_raises"] = RuntimeError("cannot create partition")
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
+    )
+
+    for _ in range(50):
+        assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+
+    assert calls["heal"] == [3]
+
+
+def test_the_rate_limit_reopens(monkeypatch, spy):
+    """The gate has to close AND open. `_last_heal = float("inf")` -- heal once
+    per process, ever -- satisfies an upper-bound assertion on its own, and
+    would leave the partition uncreated for the life of the container."""
+    calls, _ = spy
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
+    )
+
+    now = [1000.0]
+    monkeypatch.setattr(R.time, "monotonic", lambda: now[0])
+
+    r.process_job(event("Cortex/Family/School/DPS"))
+    r.process_job(event("Cortex/Family/School/DPS"))
+    assert calls["heal"] == [3]
+
+    now[0] += r.poll_interval
+    r.process_job(event("Cortex/Family/School/DPS"))
+
+    assert calls["heal"] == [3, 3]
+
+
+@pytest.mark.parametrize("created", [0, 1])
+def test_the_heal_releases_whatever_it_created(monkeypatch, spy, created):
+    """`created` is logged, not branched on: on a violation naming no
+    constraint, zero created means another worker won the race."""
+    calls, state = spy
+    state["heal_creates"] = created
+    r = make_router(monkeypatch)
+    conn = FakeConn()
+    monkeypatch.setattr(r, "_connect", lambda: conn)
+    monkeypatch.setattr(
+        R,
+        "enqueue",
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
+    )
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
+    assert calls["fail"] == []
+
+
+def test_a_settle_with_no_connection_drops_the_one_we_may_still_hold(monkeypatch, spy):
+    """`conn` is the local `_route` never received. `self._conn` can still be a
+    live object whose connect-time setup failed -- reusing it is how a router
+    talks to a connection it knows nothing good about."""
+    _, _ = spy
+    r = make_router(monkeypatch)
+    r._conn = FakeConn()
+    monkeypatch.setattr(
+        r,
+        "_connect",
+        lambda: (_ for _ in ()).throw(psycopg2.OperationalError("no server")),
+    )
+
+    assert r.process_job(event("Cortex/Family/School/DPS")) == "unsettled"
+    assert r._conn is None
+
+
+def test_a_lost_claim_counts_no_unmatched(monkeypatch, spy):
+    """The majority path, and the one whose shape gets copied. Counted before
+    the settle, a lost claim counts the event here and again on the retry."""
+    _, state = spy
+    state["complete_returns"] = False
+    r = make_router(monkeypatch)
+    before = counter("cortex_actions_unmatched", label_prefix="Cortex/Automated")
+
+    assert r._route(FakeConn(), event("Cortex/Automated/Social/X")) == "lost"
+
+    assert (
+        counter("cortex_actions_unmatched", label_prefix="Cortex/Automated") == before
+    )
+
+
+def test_a_lost_claim_counts_no_malformed_drop(monkeypatch, spy):
+    """A drop is irreversible and counts `success`, so this counter is the only
+    record that an event was discarded. It must describe drops that happened."""
+    _, state = spy
+    state["complete_returns"] = False
+    r = make_router(monkeypatch)
+    before = counter("cortex_errors", service=R.SERVICE, error_type="malformed_event")
+
+    assert r._route(FakeConn(), job({"gmail_id": "abc"})) == "lost"
+
+    assert (
+        counter("cortex_errors", service=R.SERVICE, error_type="malformed_event")
+        == before
+    )

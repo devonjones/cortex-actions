@@ -206,9 +206,15 @@ bounded by the routing table, which is a small hand-written file.
 
 Documentation is in scope for every reviewer, not a category of its own: a doc
 describing behaviour someone else changed stays wrong indefinitely and reads as
-authoritative. Both of dead-code-reviewer's accepted findings on PR #1 were
-README findings, and one of them (`service="actions"` against an emitted
-`actions-router`) was a query that would have returned no series at all.
+authoritative. On PR #1, roughly half of dead-code-reviewer's findings were in
+prose rather than code, and the sharpest of them (`service="actions"` against an
+emitted `actions-router`) was a query that would have returned no series at all
+— indistinguishable, on a dashboard, from a healthy zero.
+
+The same review found the failure mode that makes this worth a row: a wrong
+identifier in a comment gets copied. `queue_valid_status`, which exists nowhere,
+travelled from a code comment into a test fixture and then into a beads ticket
+before anyone read it off the database.
 
 ## Tooling assumed in CI
 
