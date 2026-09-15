@@ -465,7 +465,16 @@ def test_a_fault_in_the_event_still_charges_an_attempt(monkeypatch, spy):
 # -- the handler must not raise --------------------------------------------
 
 
-def test_a_settle_that_fails_does_not_kill_the_loop(monkeypatch, spy):
+@pytest.mark.parametrize(
+    "settle_error",
+    [
+        psycopg2.InterfaceError("connection already closed"),
+        psycopg2.OperationalError("server closed the connection"),
+        psycopg2.errors.InFailedSqlTransaction("current transaction is aborted"),
+        RuntimeError("something nobody predicted"),
+    ],
+)
+def test_a_settle_that_fails_does_not_kill_the_loop(monkeypatch, spy, settle_error):
     """When Postgres is gone, rollback() and release() are gone with it.
 
     The original P0 was a handler that raised the error it was handling, which
@@ -476,7 +485,7 @@ def test_a_settle_that_fails_does_not_kill_the_loop(monkeypatch, spy):
     conn = FakeConn()
 
     def dead_rollback():
-        raise psycopg2.InterfaceError("connection already closed")
+        raise settle_error
 
     conn.rollback = dead_rollback  # type: ignore[method-assign]
     r._conn = conn
@@ -762,9 +771,7 @@ def test_a_missing_partition_is_healed_before_the_job_is_handed_back(monkeypatch
     monkeypatch.setattr(
         R,
         "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(
-            psycopg2.errors.CheckViolation("no partition for 2026-09-16")
-        ),
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition for 2026-09-16")),
     )
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
@@ -773,23 +780,41 @@ def test_a_missing_partition_is_healed_before_the_job_is_handed_back(monkeypatch
     assert calls["fail"] == []
 
 
-def test_a_heal_that_fails_still_releases(monkeypatch, spy):
+@pytest.mark.parametrize(
+    "heal_error",
+    [
+        psycopg2.errors.InsufficientPrivilege("permission denied for table queue"),
+        psycopg2.errors.LockNotAvailable("canceling statement due to lock timeout"),
+        psycopg2.errors.InFailedSqlTransaction("current transaction is aborted"),
+        RuntimeError("cannot create partition"),
+    ],
+)
+def test_a_heal_that_fails_still_releases(monkeypatch, spy, heal_error):
     """Charging it would dead-letter every matched event in three passes for
     an infrastructure fault -- a role that cannot CREATE TABLE, a shadowed
     partition name, a lock timeout. Those are the healthy events this project
     exists not to lose. The backstop against spinning is the rate limit and
-    run()'s no-progress sleep, not the attempt budget."""
+    run()'s no-progress sleep, not the attempt budget.
+
+    PARAMETRISED OVER REAL EXCEPTION TYPES, because a broad `except` narrows to
+    whatever its test happens to raise. This one only ever saw a RuntimeError
+    -- including one spelled `RuntimeError("no permission")` -- so narrowing it
+    to RuntimeError passed the suite, and a real InsufficientPrivilege would
+    then escape the heal, the CheckViolation handler, process_job, run() and
+    main(). That is the P0 shape, coming out of the guard whose own docstring
+    says a failed heal still releases.
+    """
     calls, state = spy
-    state["heal_raises"] = RuntimeError("cannot create partition")
+    state["heal_raises"] = heal_error
     r = make_router(monkeypatch)
     conn = FakeConn()
     monkeypatch.setattr(r, "_connect", lambda: conn)
+    # raising_enqueue, not a bare throw: a failed statement aborts the
+    # transaction, which is the state the heal has to cope with.
     monkeypatch.setattr(
         R,
         "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(
-            psycopg2.errors.CheckViolation("no partition for 2026-09-16")
-        ),
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition for 2026-09-16")),
     )
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
@@ -1151,7 +1176,16 @@ def test_run_creates_the_schema_before_it_claims(monkeypatch, spy):
     assert seen == [[R.DEDUP_INDEX]]
 
 
-def test_a_dead_database_does_not_kill_the_loop(monkeypatch, spy):
+@pytest.mark.parametrize(
+    "claim_error",
+    [
+        psycopg2.OperationalError("server closed the connection"),
+        psycopg2.InterfaceError("connection already closed"),
+        psycopg2.errors.UndefinedTable('relation "queue" does not exist'),
+        RuntimeError("something nobody predicted"),
+    ],
+)
+def test_a_dead_database_does_not_kill_the_loop(monkeypatch, spy, claim_error):
     """claim() raising must drop the connection and sleep, not re-raise.
 
     A reused dead connection means a router that logs nothing and routes
@@ -1165,7 +1199,7 @@ def test_a_dead_database_does_not_kill_the_loop(monkeypatch, spy):
     monkeypatch.setattr(r, "_sleep", lambda: r._stop.set())
 
     def dead_claim(*a, **k):
-        raise psycopg2.OperationalError("server closed the connection")
+        raise claim_error
 
     monkeypatch.setattr(R, "claim", dead_claim)
     r.run()  # must return, not raise
@@ -1655,9 +1689,7 @@ def test_the_heal_rolls_back_before_it_runs_ddl(monkeypatch, spy):
     monkeypatch.setattr(
         R,
         "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(
-            psycopg2.errors.CheckViolation("no partition")
-        ),
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
     )
 
     assert r.process_job(event("Cortex/Family/School/DPS")) == "released"
@@ -1678,9 +1710,7 @@ def test_the_heal_runs_at_most_once_per_poll_interval(monkeypatch, spy):
     monkeypatch.setattr(
         R,
         "enqueue",
-        lambda *a, **k: (_ for _ in ()).throw(
-            psycopg2.errors.CheckViolation("no partition")
-        ),
+        raising_enqueue(psycopg2.errors.CheckViolation("no partition")),
     )
 
     for _ in range(50):
@@ -2083,7 +2113,16 @@ def test_the_lock_timeout_is_reset_after_a_heal_that_failed(monkeypatch, spy):
     assert not conn.aborted
 
 
-def test_setting_the_lock_timeout_can_never_raise(monkeypatch):
+@pytest.mark.parametrize(
+    "boom",
+    [
+        psycopg2.InterfaceError("connection already closed"),
+        psycopg2.OperationalError("server closed the connection"),
+        psycopg2.errors.InFailedSqlTransaction("current transaction is aborted"),
+        RuntimeError("something nobody predicted"),
+    ],
+)
+def test_setting_the_lock_timeout_can_never_raise(monkeypatch, boom):
     """It is called from a `finally` inside an exception handler.
 
     Anything escaping there escapes process_job, run() and main() -- and a
@@ -2096,10 +2135,57 @@ def test_setting_the_lock_timeout_can_never_raise(monkeypatch):
     class Hostile:
         """Fails on the first thing touched. `rollback()` is now the first
         statement of the try, so the rest is unreachable -- and that is the
-        point: whatever comes first, nothing escapes."""
+        point: whatever comes first, nothing escapes.
+
+        Parametrised over several types because a broad `except` narrows to
+        whatever its test raises, and every one in this file did."""
 
         def rollback(self):
-            raise psycopg2.InterfaceError("connection already closed")
+            raise boom
 
     r._set_lock_timeout(Hostile(), R.LOCK_TIMEOUT)
     r._set_lock_timeout(Hostile(), None)
+
+
+def test_the_worker_token_identifies_this_process(monkeypatch):
+    """`worker_identity(SERVICE)`, not `SERVICE`.
+
+    The token is what `complete`, `release` and `fail_or_retry` match a claim
+    against, so two routers sharing one would each settle the other's jobs --
+    and `claim()` refuses an empty one outright. Nothing asserted it was more
+    than the service name.
+    """
+    r = make_router(monkeypatch)
+    other = make_router(monkeypatch)
+
+    assert r._worker and r._worker != R.SERVICE
+    assert R.SERVICE in r._worker
+    assert r._worker != other._worker or "-" in r._worker
+
+
+def test_main_passes_its_environment_through_to_the_router(monkeypatch):
+    """The DSN, batch size, poll interval and subscriptions path are all read
+    from the environment in `main()` and nothing checked any of them arrive."""
+    for v in ("POSTGRES_HOST", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"):
+        monkeypatch.setenv(v, f"value-of-{v}")
+    monkeypatch.setenv("POSTGRES_PORT", "6543")
+    monkeypatch.setenv("BATCH_SIZE", "7")
+    monkeypatch.setenv("POLL_INTERVAL", "11")
+    monkeypatch.setenv("SUBSCRIPTIONS_PATH", "/somewhere/subs.yaml")
+    seen: list = []
+    monkeypatch.setattr(R, "load", lambda path: (seen.append(path), SUBS)[1])
+    monkeypatch.setattr(R, "start_metrics_server", lambda port: None)
+    monkeypatch.setattr(R.signal, "signal", lambda sig, fn: None)
+    built: list = []
+    monkeypatch.setattr(R.Router, "run", lambda self: built.append(self))
+
+    R.main()
+
+    r = built[0]
+    assert seen == ["/somewhere/subs.yaml"]
+    assert r.batch_size == 7
+    assert r.poll_interval == 11
+    assert "host=value-of-POSTGRES_HOST" in r.dsn
+    assert "port=6543" in r.dsn
+    assert "dbname=value-of-POSTGRES_DB" in r.dsn
+    assert "password=value-of-POSTGRES_PASSWORD" in r.dsn

@@ -1,6 +1,7 @@
 import pytest
 
 from actions.subscriptions import (
+    VALID_EVENTS,
     Subscription,
     SubscriptionError,
     load,
@@ -287,3 +288,66 @@ def test_matching_does_not_go_through_the_case_folding_matcher(monkeypatch):
         label="Cortex/Family/*", queue="school", events=frozenset({"added"})
     )
     assert sub.matches("Cortex/Family/School", "added") is True
+
+
+def test_the_loader_will_not_construct_python_objects(tmp_path):
+    """`yaml.safe_load`, not `load`/`unsafe_load`.
+
+    The routing table is a bind mount, re-read on every SIGHUP, so whoever can
+    write that file decides what the loader does with it. Swapping in
+    `unsafe_load` survived every other test in this module, because a
+    constructed object fails `parse()`'s mapping check a moment later and the
+    caller sees a `SubscriptionError` either way -- the difference is that the
+    tag has already run by then.
+
+    So this asserts the side effect did not happen, not the exception.
+    """
+    marker = tmp_path / "executed"
+    f = tmp_path / "subs.yaml"
+    # os.makedirs, not a Path constructor: the tag has to DO something
+    # observable, or the test passes under both loaders and proves nothing.
+    f.write_text(f"subscriptions: !!python/object/apply:os.makedirs ['{marker}']\n")
+
+    with pytest.raises(SubscriptionError):
+        load(f)
+
+    assert not marker.exists(), "the loader executed a tag in the routing table"
+
+
+def test_every_valid_event_is_actually_accepted():
+    """`VALID_EVENTS` is a closed set that nothing closes: dropping a member
+    leaves the suite green, and the member that would go is `removed` -- the
+    one a subscription has to opt into, so losing it silently stops carrying
+    un-labelling to consumers that asked for it."""
+    for event in VALID_EVENTS:
+        subs = parse(
+            {"subscriptions": [{"label": "Cortex/*", "queue": "s", "events": [event]}]}
+        )
+        assert subs[0].matches("Cortex/Thing", event)
+    assert frozenset({"added", "removed"}) == VALID_EVENTS
+
+
+def test_one_label_may_fan_out_to_several_queues():
+    """The duplicate-rule check keys on (label, queue), and narrowing it to
+    (label,) survived -- which would refuse the fan-out this service exists to
+    do. Both directions: two queues for one label is legal, the same pair twice
+    is not."""
+    subs = parse(
+        {
+            "subscriptions": [
+                {"label": "Cortex/Family/School/*", "queue": "school"},
+                {"label": "Cortex/Family/School/*", "queue": "vault"},
+            ]
+        }
+    )
+    assert targets(subs, "Cortex/Family/School/DPS", "added") == ["school", "vault"]
+
+    with pytest.raises(SubscriptionError, match="duplicate"):
+        parse(
+            {
+                "subscriptions": [
+                    {"label": "Cortex/Family/School/*", "queue": "school"},
+                    {"label": "Cortex/Family/School/*", "queue": "school"},
+                ]
+            }
+        )
