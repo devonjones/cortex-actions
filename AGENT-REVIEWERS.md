@@ -17,10 +17,11 @@
 Each H2 names a reviewer. The one-line summary tells the main loop **what it
 checks and when to spawn it** — use it to decide whether the PR diff is in scope.
 
-The roster is deliberately short. Five project-specific reviewers guard the ways
-this service can quietly stop being trustworthy. The generic Python pack
-(`test-coverage`, `error-handling`, `resource-leak`, `clarity`) gets added on the
-first PR that brushes against it, rather than carried from day one.
+The roster is deliberately short. Project-specific reviewers guard the ways this
+service can quietly stop being trustworthy. The rest of the generic Python pack
+(`error-handling`, `resource-leak`, `clarity`) gets added on the first PR that
+brushes against it, rather than carried from day one — `test-coverage` was added
+that way on PR #1.
 
 This service sits on the critical path for every label event in the system, so
 the bar for "this is fine, it only affects X" is higher here than in a leaf
@@ -130,6 +131,44 @@ configured and does nothing — which is this repo's signature failure mode
 
 ---
 
+## test-coverage-reviewer
+
+**What it checks:** that the suite constrains the code, rather than agreeing
+with it. Added on PR #1, which existed because ten router tests passed against a
+`FakeJob` dataclass with `.id`/`.payload` — a shape `cortex_utils.queue.claim()`
+has never returned — while the service could not process a single real job.
+**When to spawn:** any PR that changes `tests/**`, or that changes behaviour
+under test.
+
+**Default severity: P2**, raised to **P1** where the untested path is one whose
+failure is silent (a settle path, a signal handler, the reload, `run()`'s error
+handling).
+
+Flag specifically:
+1. **A stub that does not match the real signature.** Check every
+   `monkeypatch.setattr` against `inspect.signature` of the thing it replaces —
+   argument names, order, and return type. A fake that accepts what the real
+   function rejects is the original defect wearing a new face.
+2. **A test that cannot fail**: assertions over the test's own constructions,
+   both sides derived from the same constant, a membership test against a set
+   the test just built. `assert column in ddl` passes with the column deleted
+   when the name also appears in a comment above it.
+3. **The direction that is never tested.** A guard is half-tested until
+   something proves it does not reject the real thing.
+4. **Paths nothing drives** — `main()`, signal handlers, the reload, the claim
+   error path, `_drop_conn`. Survivors cluster there.
+
+**Review approach:** mutate the production code adversarially and report the
+table. A mutation whose anchor fails to apply reports as PASSING and means
+nothing, so assert the anchor applied before concluding anything; clear
+`__pycache__` and run with `PYTHONDONTWRITEBYTECODE=1`; and work in an isolated
+copy, because a concurrent reviewer may be mutating the same tree.
+
+**Do NOT flag:** a missing test with no concrete defect behind it. "No test for
+X" without the failure X would ship is P3 at most.
+
+---
+
 ## metric-cardinality-reviewer
 
 **What it checks:** that no Prometheus label dimension grows with user data.
@@ -160,9 +199,22 @@ bounded by the routing table, which is a small hand-written file.
 | `src/actions/services/router.py` | queue-contract, routing-silence, metric-cardinality |
 | `src/actions/subscriptions.py` | routing-silence, loop-safety |
 | `config/subscriptions.yaml` | loop-safety |
-| `tests/**` | test-coverage (once added) |
+| `tests/**` | test-coverage |
 | `src/actions/**`, `config/subscriptions.yaml` | dead-code |
 | `Dockerfile`, `.github/workflows/**` | homelab-values |
+| `README.md`, `CLAUDE.md`, `*.md` | dead-code, plus whichever reviewer owns the behaviour being described |
+
+Documentation is in scope for every reviewer, not a category of its own: a doc
+describing behaviour someone else changed stays wrong indefinitely and reads as
+authoritative. On PR #1, roughly half of dead-code-reviewer's findings were in
+prose rather than code, and the sharpest of them (`service="actions"` against an
+emitted `actions-router`) was a query that would have returned no series at all
+— indistinguishable, on a dashboard, from a healthy zero.
+
+The same review found the failure mode that makes this worth a row: a wrong
+identifier in a comment gets copied. `queue_valid_status`, which exists nowhere,
+travelled from a code comment into a test fixture and then into a beads ticket
+before anyone read it off the database.
 
 ## Tooling assumed in CI
 
